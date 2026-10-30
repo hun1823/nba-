@@ -16,6 +16,8 @@ import os
 import re
 import sys
 import time
+import tempfile
+from injury_feed import download_feed, parse_feed, utc_now
 import unicodedata
 import urllib.request
 
@@ -256,20 +258,10 @@ def main():
         time.sleep(0.2)
 
     print("  ESPN 부상자 명단 받는 중...")
-    ij = espn_json("https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries", "espn_injuries.json")
-    injuries = {}
-    for team in ij.get("injuries", []):
-        for inj in team.get("injuries", []):
-            a = inj.get("athlete", {})
-            det = inj.get("details", {}) or {}
-            injuries[str(espn_id_from_links(a))] = {
-                "status": inj.get("status", ""),
-                "type": " ".join(x for x in (det.get("side", ""), det.get("type", ""), det.get("detail", "")) if x),
-                "returnDate": det.get("returnDate", ""),
-                "comment": inj.get("shortComment", ""),
-                "date": inj.get("date", ""),
-                "name": a.get("displayName", ""),
-            }
+    # Injury reports are time-sensitive: never reuse the 3-hour statistics cache.
+    injury_snapshot = parse_feed(download_feed())
+    injuries = injury_snapshot['injuries']
+    injuries_fetched_at = utc_now()
 
     # ---- 로스터와 통계 연결 ----
     cur = seasons.get(str(cur_year), {}).get("players", {})
@@ -362,13 +354,21 @@ def main():
         "updated": dt.datetime.now(dt.timezone.utc).isoformat(),
         "curSeason": str(cur_year), "prevSeason": str(prev_year),
         "seasonLabels": {str(cur_year): label(cur_year), str(prev_year): label(prev_year)},
+        "injuryMeta": {"source": "ESPN", "fetchedAt": injuries_fetched_at, "sourceUpdatedAt": injury_snapshot["sourceUpdatedAt"]},
         "teams": teams_out, "teamStats": team_stats, "players": players_out, "games": games_u,
     }
     os.makedirs(DATA_DIR, exist_ok=True)
-    with open(os.path.join(DATA_DIR, "nba_data.js"), "w", encoding="utf-8") as f:
-        f.write("window.NBA_DATA = ")
-        json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
-        f.write(";\n")
+    # The local server must never serve a half-written JavaScript payload.
+    fd, temporary = tempfile.mkstemp(prefix='nba_data.', suffix='.tmp', dir=DATA_DIR)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write('window.NBA_DATA = ')
+            json.dump(payload, f, ensure_ascii=False, separators=(',', ':'))
+            f.write(';\n')
+        os.replace(temporary, os.path.join(DATA_DIR, 'nba_data.js'))
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
     # ---- 엑셀용 CSV ----
     cols = [("선수", "name"), ("팀", "team"), ("포지션", "pos"), ("경기", "g"), ("출전시간", "mpg"),

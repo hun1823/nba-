@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+data/cache/
+data/injuries_live.json

@@ -59,6 +59,9 @@
   ];
   let S = Object.assign({}, DEFAULTS, load('settings', {}));
   Object.keys(DEFAULTS).forEach(k => { if (k !== 'dtdOut' && (!Number.isFinite(S[k]) || S[k] < 0 || (['sdMargin','sdTotal','teamK'].includes(k) && S[k] === 0) || (k === 'rosterW' && S[k] > 1))) S[k] = DEFAULTS[k]; });
+  let liveInjuryState = null;
+  let liveConnected = false;
+  let liveBusy = false;
   let overrides = {};
   let minuteOverrides = {};
   let scenarioScope = '';
@@ -500,7 +503,8 @@
     if (!lastPred || !lastPred.valid || state.home === state.away) return;
     if (scenarios.length >= 3) { $('#scenarioNote').textContent = '최대 3개입니다. 기존 시나리오를 삭제한 뒤 저장하세요.'; return; }
     const name = $('#scenarioName').value.trim() || `시나리오 ${scenarios.length + 1}`;
-    scenarios.push({name, out: {...overrides}, minutes: {...minuteOverrides}, options: {...state}});
+    const resolvedOut = Object.fromEntries(D.players.filter(p=>[state.home,state.away].includes(p.team)).map(p=>[p.eid,isOut(p)]));
+    scenarios.push({name, out: resolvedOut, minutes: {...minuteOverrides}, options: {...state}});
     saveMatchup(); renderScenarios();
   });
   $('#scenarioRows').addEventListener('click', e => {
@@ -523,13 +527,14 @@
   }
 
   // ---------- 로스터 / 부상자 선택 ----------
+  const injuryLabel = status => ({Out:'결장', 'Day-To-Day':'당일 확인', Questionable:'출전 불투명', Doubtful:'결장 유력', Probable:'출전 유력'}[status] || status);
   function statusChip(p) {
     const inj = p.injury;
     const man = p.eid in overrides && overrides[p.eid] !== defaultOut(p);
     let h = '';
     if (inj) {
       const tip = [inj.date ? '부상 보고 ' + inj.date : '보고 시각 없음', inj.type, inj.returnDate ? '복귀 예상 ' + inj.returnDate : '', inj.comment].filter(Boolean).join(' · ');
-      h += `<span class="chip ${inj.status === 'Out' ? 'out' : 'dtd'}" title="${esc(tip)}">${inj.status === 'Out' ? '결장' : '불투명'}${inj.type ? ' · ' + esc(inj.type) : ''}</span>`;
+      h += `<span class="chip ${inj.status === 'Out' ? 'out' : 'dtd'}" title="${esc(tip)}">${esc(injuryLabel(inj.status))}${inj.type ? ' · ' + esc(inj.type) : ''}</span>`;
     }
     if (man) h += ` <span class="chip man">직접 ${overrides[p.eid] ? '제외' : '포함'}</span>`;
     return h;
@@ -633,7 +638,7 @@
   const modeSel = $('#pMode');
   modeSel.innerHTML = `<option value="blend">혼합 (${esc(LBL[CUR])} + ${esc(LBL[PREV])}, 모델 기준)</option><option value="cur">${esc(LBL[CUR])} (이번 시즌)</option><option value="prev">${esc(LBL[PREV])} (지난 시즌)</option>`;
   $('#pTeam').innerHTML += TEAMS.map(t => `<option value="${t}">${esc(tName(t))} (${t})</option>`).join('');
-  const statusText = p => isOut(p) ? '결장' : (p.injury ? '불투명' : '');
+  const statusText = p => isOut(p) ? '결장' : (p.injury ? injuryLabel(p.injury.status) : '명단 없음');
 
   function playerRows() {
     const mode = $('#pMode').value, team = $('#pTeam').value, q = $('#pSearch').value.trim().toLowerCase();
@@ -876,7 +881,7 @@
     const snapshot = (teamModel) => ({off:teamModel.off, def:teamModel.def, pace:teamModel.pace,
       rotation:teamModel.rot.list.map(x=>({eid:x.p.eid, name:x.p.name, minutes:x.final, out:!!x.out, ability:modelBPM(x.p), currentWeight:F.currentWeight(x.p.cur,x.p.prev)}))});
     const record = {id:crypto.randomUUID(), gameId:game.id, version:F.VERSION, signature:modelSignature(), savedAt:now.toISOString(), start:game.date,
-      home:state.home, away:state.away, dataUpdated:D.updated, settings:{...S}, overrides:{...overrides}, minutes:{...minuteOverrides},
+      home:state.home, away:state.away, dataUpdated:D.updated, injurySource:liveInjuryState?.snapshot ? {fetchedAt:liveInjuryState.fetchedAt,sourceUpdatedAt:liveInjuryState.snapshot.sourceUpdatedAt} : (D.injuryMeta || null), settings:{...S}, overrides:{...overrides}, minutes:{...minuteOverrides},
       options:{neutral:state.neutral,b2bH:state.b2bH,b2bA:state.b2bA,adjH:state.adjH,adjA:state.adjA},
       raw:{margin:lastPred.margin,total:lastPred.total,sdMargin:S.sdMargin,sdTotal:S.sdTotal},
       lines:{margin:hc==null?null:-hc,total:ou}, settlement:$('#settlement').value,
@@ -938,6 +943,74 @@
     e.target.value='';
   });
 
+  // Live injuries use the local Python server; file:// keeps the bundled snapshot.
+  async function liveRequest(path, post = false) {
+    const controller = new AbortController(), timeout = setTimeout(()=>controller.abort(),25000);
+    try {
+      const response = await fetch(path, {method:post?'POST':'GET', cache:'no-store', signal:controller.signal,
+        ...(post ? {headers:{'Content-Type':'application/json'},body:'{}'} : {})});
+      const data = await response.json();
+      if (!response.ok && data.status !== 'error') throw new Error('HTTP '+response.status);
+      return data;
+    } finally { clearTimeout(timeout); }
+  }
+  function showLiveState(data) {
+    const snap = data.snapshot;
+    let text = data.status === 'ok' ? '조회 성공' : data.status === 'error' ? '조회 실패 · 기존 자료 유지' : '아직 조회하지 않았습니다';
+    if (data.fetchedAt) text += ' · 마지막 성공 '+kst(data.fetchedAt);
+    if (snap?.sourceUpdatedAt) {
+      text += ' · ESPN 원문 시각 '+kst(snap.sourceUpdatedAt);
+      if (Date.now()-Date.parse(snap.sourceUpdatedAt)>30*60000) text += ' · 원문이 30분 이상 지난 자료입니다';
+    }
+    if (data.retryAfter) text += ' · 재조회까지 '+data.retryAfter+'초';
+    if (data.message) text += ' · '+data.message;
+    $('#injuryLiveStatus').textContent = text;
+    // Failure responses can contain a last-good snapshot, but must not erase newer bundled information.
+    const bundleTime = Date.parse(D.injuryMeta?.sourceUpdatedAt || '');
+    if (snap?.injuries && snap.sourceUpdatedAt && !(Number.isFinite(bundleTime) && Date.parse(snap.sourceUpdatedAt)<bundleTime)) {
+      liveInjuryState = data;
+      D.players.forEach(p=>{p.injury=snap.injuries[p.eid] || null;});
+      renderAll();
+    }
+  }
+  async function refreshLiveInjuries() {
+    if (!liveConnected || liveBusy) return;
+    liveBusy=true;$('#refreshInjuries').disabled=true;
+    $('#injuryLiveStatus').textContent='ESPN 조회 중… 기존 자료를 표시합니다.';
+    try { showLiveState(await liveRequest('/api/injuries/refresh',true)); }
+    catch (_) { $('#injuryLiveStatus').textContent='서버 연결 실패 · 기존 자료를 유지합니다. 시작하기.command의 터미널이 열려 있는지 확인하세요.'; }
+    finally { liveBusy=false;$('#refreshInjuries').disabled=false; }
+  }
+  function showFullUpdate(status) {
+    const state = status.dataUpdate?.state;
+    $('#fullUpdateStatus').textContent = state==='running' ? '전체 통계 갱신 중… 현재는 기존 통계로 표시합니다.' : state==='complete' ? '전체 통계 갱신 완료. 새 통계를 적용하려면 아래 버튼을 누르세요. (현재 입력은 초기화될 수 있습니다.)' : state==='error' ? '전체 통계 갱신 실패. 기존 통계를 표시합니다. 터미널의 오류를 확인하세요.' : '';
+    $('#reloadData').hidden=state!=='complete';
+    return state==='running';
+  }
+  async function initializeLive() {
+    $('#autoInjuries').checked=load('liveAuto',true);
+    if (!['http:','https:'].includes(location.protocol)) {
+      $('#injuryLiveStatus').textContent='저장된 부상 정보를 표시합니다. 자동 갱신은 시작하기.command로 실행하세요.';return;
+    }
+    try {
+      const status=await liveRequest('/api/status');
+      if(status.app!=='nba-helper-live-v1') throw new Error('not a live server');
+      liveConnected=true;$('#refreshInjuries').disabled=false;
+      showLiveState(await liveRequest('/api/injuries'));
+      if(showFullUpdate(status)) {
+        const timer=setInterval(async()=>{
+          try { if(!showFullUpdate(await liveRequest('/api/status'))) clearInterval(timer); }
+          catch(_){ clearInterval(timer);$('#fullUpdateStatus').textContent='서버 연결이 끊겼습니다.'; }
+        },5000);
+      }
+      if($('#autoInjuries').checked) refreshLiveInjuries();
+    } catch(_) { $('#injuryLiveStatus').textContent='일반 파일 서버에서는 자동 조회할 수 없습니다. 시작하기.command 또는 python3 serve.py로 실행하세요.'; }
+  }
+  $('#refreshInjuries').addEventListener('click',refreshLiveInjuries);
+  $('#autoInjuries').addEventListener('change',()=>{save('liveAuto',$('#autoInjuries').checked);if($('#autoInjuries').checked) refreshLiveInjuries();});
+  $('#reloadData').addEventListener('click',()=>location.reload());
+  setInterval(()=>{if($('#autoInjuries').checked && !document.hidden) refreshLiveInjuries();},300000);
+
   // ---------- 시작 ----------
   function renderAll() {
     renderGames(); renderPredict();
@@ -953,4 +1026,5 @@
   if (firstGame) selectGame(firstGame);
   else { state.home = TEAMS[0]; state.away = TEAMS[1]; syncPickers(); renderGames(); renderPredict(); }
   showTab(state.tab);
+  initializeLive();
 })();
