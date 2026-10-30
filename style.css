@@ -201,3 +201,10 @@ a.tlink:hover { text-decoration: underline; }
 .scenarios .table-wrap { margin-top: 12px; }
 .scenarios td { white-space: nowrap; }
 #dataQuality p { margin: 8px 0; }
+
+.calibration-status { border-left: 3px solid var(--accent); padding: 0 12px; margin: 16px 0; }
+.history-grid td { white-space: normal; min-width: 180px; vertical-align: top; }
+.history-grid input[type=number] { width: 5em; }
+.history-grid form { display: flex; gap: 8px; flex-wrap: wrap; }
+.history-import { display: inline-block; margin: 8px; }
+#recordMessage, #historyMessage { color: var(--warn); }

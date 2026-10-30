@@ -16,6 +16,7 @@
     <button data-tab="predict" class="active">경기 예측</button>
     <button data-tab="players">선수 통계</button>
     <button data-tab="teams">팀 통계</button>
+    <button data-tab="history">예측 기록 · 검증</button>
     <button data-tab="help">모델 설명 · 설정</button>
   </nav>
 </header>
@@ -56,6 +57,8 @@
           <h3>핸디캡 · 언더오버 분석 <small>배당은 소수 배당(예: 1.85)으로 입력하세요. 비워두면 확률만 표시돼요.</small></h3>
           <p class="muted">홈 -3.5는 홈팀이 4점 이상 이겨야 핸디 승입니다. 입력 기준점은 아래 모든 시나리오에 공통 적용됩니다. 정규시간 240분 기반 모델이며 연장 득점은 따로 예측하지 않습니다. 상품의 연장 포함 여부를 확인하세요.</p>
           <label>정수 기준점 동점 처리 <select id="settlement"><option value="unknown">규칙 미확인 (기대값 보류)</option><option value="refund">원금 환급</option><option value="loss">양 선택 모두 미적중</option></select></label>
+          <div id="calibrationStatus" class="calibration-status"></div>
+          <button id="recordPrediction">경기 전 예측 기록</button> <span id="recordMessage" role="status"></span>
           <div class="calc-grid">
             <div class="calc-box">
               <h4>핸디캡 <small>(홈팀 기준, 예: -3.5)</small></h4>
@@ -123,6 +126,19 @@
     <div class="table-wrap" id="tTableWrap"></div>
   </section>
 
+  <section id="tab-history" class="tab">
+    <div class="card">
+      <h2>경기 전 예측 기록 · 정규시간 결과 검증</h2>
+      <p>경기 시작 전에 저장한 예측만 학습에 사용합니다. 한 경기당 최초 기록을 보존하며, 결과를 입력해도 당시 확률·배당·기준점은 바뀌지 않습니다.</p>
+      <p>현재 모델은 48분 기준입니다. 연장 경기라면 <b>4쿼터 종료 점수</b>를 입력하세요. 연장 포함 최종 점수로 학습하지 않습니다. 정규시간용 예측은 연장 포함 상품의 확률과 같지 않습니다.</p>
+      <button id="exportHistory">기록 백업(JSON)</button>
+      <label class="history-import">백업 불러오기 <input type="file" id="importHistory" accept=".json,application/json"></label>
+      <p id="historyMessage" role="status"></p>
+      <div id="historySummary"></div>
+      <div id="historyTable" class="table-wrap"></div>
+    </div>
+  </section>
+
   <!-- 설명 -->
   <section id="tab-help" class="tab">
     <div class="help-grid">
@@ -142,6 +158,7 @@
 </footer>
 
 <script src="data/nba_data.js"></script>
+<script src="forecast.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

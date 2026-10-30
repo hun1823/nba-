@@ -48,13 +48,12 @@
   D.players.forEach(p => { (byTeam[p.team] = byTeam[p.team] || []).push(p); });
 
   // ---------- 설정 ----------
-  const DEFAULTS = { hca: 2.4, sdMargin: 12.5, sdTotal: 18, prevGames: 25, teamK: 20, rosterW: 0.65, b2b: 1.5, dtdOut: false };
+  const DEFAULTS = { hca: 2.4, sdMargin: 12.5, sdTotal: 18, teamK: 20, rosterW: 0.65, b2b: 1.5, dtdOut: false };
   const SETTINGS_META = [
     ['hca', '홈 어드밴티지 (점)', 0.1, '홈팀이 얻는 점수차 이점. 최근 NBA는 약 2~2.5점.'],
     ['b2b', '백투백 페널티 (점)', 0.1, '전날 경기를 치른 팀이 잃는 점수차.'],
     ['sdMargin', '점수차 표준편차', 0.5, '경기 결과가 예측에서 흔들리는 정도. NBA는 약 12~13점.'],
     ['sdTotal', '총점 표준편차', 0.5, '총점이 예측에서 흔들리는 정도. NBA는 약 17~19점.'],
-    ['prevGames', '지난 시즌 가중치 (경기 수 환산)', 1, '지난 시즌 기록을 이번 시즌 몇 경기만큼 믿을지. 시즌 초반엔 크게.'],
     ['teamK', '팀 실제 성적 신뢰 기준 (경기)', 1, '이 경기 수만큼 치르면 이번 시즌 팀 실제 성적을 50% 반영.'],
     ['rosterW', '로스터 기반 비중 (0~1)', 0.05, '시즌 전 기준값에서 "현재 로스터 선수 능력" 대 "지난 시즌 팀 성적" 비율.'],
   ];
@@ -85,7 +84,17 @@
     if (a == null) return b; if (b == null) return a;
     return (wa + wb) > 0 ? (a * wa + b * wb) / (wa + wb) : a;
   };
-  const prevWeight = q => q ? S.prevGames * Math.min(1, (q.g || 0) / 30) : 0;
+  const F = NBAForecast;
+  const positionGroup = p => /C/.test(p.pos) ? 'C' : /G/.test(p.pos) ? 'G' : 'F';
+  const rolePriors = {};
+  for (const group of ['G','F','C']) {
+    const players = D.players.filter(p => positionGroup(p) === group && F.minutes(p.prev) >= 300);
+    rolePriors[group] = {};
+    for (const key of ['obpm','dbpm']) {
+      const values = players.map(p=>p.prev[key]).filter(Number.isFinite);
+      rolePriors[group][key] = values.length ? values.reduce((a,b)=>a+b,0)/values.length : key === 'obpm' ? -1 : -.5;
+    }
+  }
 
   function stats(p, mode) {
     const c = p.cur, q = p.prev;
@@ -96,10 +105,10 @@
     else if (!c) o = Object.assign({}, q, { g: 0, gPrev: q.g });
     else if (!q) o = Object.assign({}, c, { gPrev: 0 });
     else {
-      const wc = c.g || 0, wp = prevWeight(q);
+      const wc = F.currentWeight(c, q), wp = 1 - wc;
       o = { g: c.g, gs: c.gs, gPrev: q.g };
       PG_KEYS.forEach(k => { o[k] = wavg(c[k], wc, q[k], wp); });
-      const mc = (c.mpg || 0) * wc, mq = (q.mpg || 0) * wp;
+      const mc = wc, mq = wp;
       MIN_KEYS.forEach(k => { o[k] = wavg(c[k], mc, q[k], mq); });
       o.fg_pct = o.fga > 0 ? o.fg / o.fga : null;
       o.fg3_pct = o.fg3a > 0.05 ? o.fg3 / o.fg3a : null;
@@ -110,28 +119,16 @@
     return o;
   }
 
-  // 모델용 BPM: 출전 시간이 적으면 평균 이하 선수(사전값) 쪽으로 당김
-  const PRIOR_MIN = 250, PRIOR_OBPM = -1.0, PRIOR_DBPM = -0.5, PREV_MIN_FACTOR = 0.6;
+  // Ability uses a season prior; current role minutes are estimated independently.
   const bpmCache = new Map();
   function modelBPM(p) {
     if (bpmCache.has(p.eid)) return bpmCache.get(p.eid);
-    const mc = (p.cur && p.cur.mp) || 0, mq = ((p.prev && p.prev.mp) || 0) * PREV_MIN_FACTOR;
-    const ob = (((p.cur && p.cur.obpm) || 0) * mc + ((p.prev && p.prev.obpm) || 0) * mq + PRIOR_OBPM * PRIOR_MIN) / (mc + mq + PRIOR_MIN);
-    const db = (((p.cur && p.cur.dbpm) || 0) * mc + ((p.prev && p.prev.dbpm) || 0) * mq + PRIOR_DBPM * PRIOR_MIN) / (mc + mq + PRIOR_MIN);
-    const r = { ob, db };
+    const prior = rolePriors[positionGroup(p)];
+    const r = {ob: F.ability(p.cur, p.prev, 'obpm', prior.obpm), db: F.ability(p.cur, p.prev, 'dbpm', prior.dbpm)};
     bpmCache.set(p.eid, r);
     return r;
   }
-
-  // 예상 출전 시간: 이번 시즌 '팀 경기당' 출전 시간(결장 경기는 0)과 지난 시즌 평균을 섞음
-  function projMin(p) {
-    const tg = teamG(CUR, p.team);
-    const mc = tg > 0 ? ((p.cur && p.cur.mp) || 0) / tg : null;
-    const mq = p.prev ? p.prev.mpg : null;
-    const wc = tg > 0 ? tg : 0, wq = mq != null ? prevWeight(p.prev) : 0;
-    if (mc == null && mq == null) return 0;
-    return wavg(mc, wc, mq, wq) || 0;
-  }
+  function projMin(p) { return F.roleMinutes(p.cur, p.prev); }
 
   // 로테이션 (팀 합계 240분)
   // 1) 건강할 때: 출전 시간이 많은 선수부터 채우고, 240분을 넘는 부분은 로스터 끝자리 선수에서 잘라냄
@@ -266,6 +263,7 @@
     $$('.tab').forEach(s => s.classList.toggle('active', s.id === 'tab-' + t));
     if (t === 'players') renderPlayers();
     if (t === 'teams') renderTeams();
+    if (t === 'history') renderHistory();
   }
   $('#tabs').addEventListener('click', e => { const b = e.target.closest('button'); if (b) showTab(b.dataset.tab); });
 
@@ -413,15 +411,16 @@
   function betRows(items) {
     // items: [{pick, p, odds}]
     const rule = $('#settlement').value;
-    let h = '<div class="bet"><span class="h">선택</span><span class="h">모델 확률</span><span class="h">모델 공정 배당</span><span class="h">모델 기대값</span>';
+    let h = '<div class="bet"><span class="h">선택</span><span class="h">원래 → 적용 확률</span><span class="h">모델 공정 배당</span><span class="h">모델 기대값</span>';
     items.forEach(x => {
       const equal = x.equal || 0;
       const unresolved = equal > 0 && rule === 'unknown';
       const refund = rule === 'refund' ? equal : 0;
       const validOdds = Number.isFinite(x.odds) && x.odds > 1;
       const fair = unresolved ? '정산 선택' : x.p > 0 ? ((1-refund)/x.p).toFixed(2) : '–';
-      const ev = unresolved ? '정산 선택' : validOdds ? signed((x.p*x.odds + refund - 1)*100) + '%' : '배당 > 1 입력';
-      h += `<span>${esc(x.pick)}</span><span>${pct(x.p)}%</span><span>${fair}</span><span>${ev}</span>`;
+      const value = F.expectedValue({above:x.p,equal}, x.odds, rule);
+      const ev = unresolved ? '정산 선택' : validOdds && value !== null ? signed(value*100) + '%' : '배당 > 1 입력';
+      h += `<span>${esc(x.pick)}</span><span>${x.rawP == null ? "" : pct(x.rawP)+"% → "}${pct(x.p)}%</span><span>${fair}</span><span>${ev}</span>`;
     });
     h += '</div>';
     if (items[0].equal > 0) h += `<p class="muted">기준점과 같을 확률 ${pct(items[0].equal)}%. 동점 정산 규칙을 선택해야 배당·기대값을 계산합니다.</p>`;
@@ -430,32 +429,36 @@
 
   function renderCalc(pr) {
     if (!pr) return;
+    refreshCalibration();
     renderScenarios();
+    renderCalibration();
     if (!pr.valid || state.home === state.away) { ['outML','outHC','outOU','lineTables'].forEach(id => $('#' + id).innerHTML = '출전시간 또는 팀 선택을 확인하세요.'); return; }
     const pH = pr.pHome, pA = 1 - pH;
     $('#outML').innerHTML = betRows([{ pick: state.away + ' 승', p: pA, odds: num('oddAway') }, { pick: state.home + ' 승', p: pH, odds: num('oddHome') }]);
     const hc = num('hcLine');
     if (hc != null) {
-      const hp = marketProb(pr.margin, S.sdMargin, -hc), pc = hp.above;
-      $('#outHC').innerHTML = betRows([{ pick: `${state.home} ${signed(hc)} 핸디 승`, p: pc, equal: hp.equal, odds: num('oddHcH') }, { pick: `${state.away} ${signed(-hc)} (핸디 패)`, p: hp.below, equal: hp.equal, odds: num('oddHcA') }]);
+      const rawHp = marketProb(pr.margin, S.sdMargin, -hc);
+      const hp = adjustedProbability(pr, "margin", -hc), pc = hp.above;
+      $('#outHC').innerHTML = betRows([{ pick: `${state.home} ${signed(hc)} 핸디 승`, p: pc, rawP: rawHp.above, equal: hp.equal, odds: num('oddHcH') }, { pick: `${state.away} ${signed(-hc)} (핸디 패)`, p: hp.below, rawP: rawHp.below, equal: hp.equal, odds: num('oddHcA') }]);
     } else $('#outHC').innerHTML = '<div class="muted">홈 핸디 기준점을 입력하세요.</div>';
     const ou = num('ouLine');
     if (ou != null) {
-      const op = marketProb(pr.total, S.sdTotal, ou), po = op.above;
-      $('#outOU').innerHTML = betRows([{ pick: `오버 ${ou}`, p: po, equal: op.equal, odds: num('oddOver') }, { pick: `언더 ${ou}`, p: op.below, equal: op.equal, odds: num('oddUnder') }]);
+      const rawOp = marketProb(pr.total, S.sdTotal, ou);
+      const op = adjustedProbability(pr, "total", ou), po = op.above;
+      $('#outOU').innerHTML = betRows([{ pick: `오버 ${ou}`, p: po, rawP: rawOp.above, equal: op.equal, odds: num('oddOver') }, { pick: `언더 ${ou}`, p: op.below, rawP: rawOp.below, equal: op.equal, odds: num('oddUnder') }]);
     } else $('#outOU').innerHTML = '<div class="muted">기준점을 입력하세요.</div>';
 
     // 기준점별 확률표
     let hcRows = '';
     for (let i = -6; i <= 6; i++) {
       const L = Math.floor(-pr.margin) + 0.5 + i * 1;
-      const p = Phi((pr.margin + L) / S.sdMargin);
+      const p = adjustedProbability(pr, "margin", -L).above;
       hcRows += `<tr class="${Math.abs(L + pr.margin) < 0.76 ? 'near' : ''}"><td>${esc(state.home)} ${signed(L)}</td><td>${(p * 100).toFixed(1)}%</td><td>${(1 / p).toFixed(2)}</td><td>${((1 - p) * 100).toFixed(1)}%</td><td>${(1 / (1 - p)).toFixed(2)}</td></tr>`;
     }
     let ouRows = '';
     for (let i = -6; i <= 6; i++) {
       const L = Math.floor(pr.total) + 0.5 + i * 2;
-      const p = 1 - Phi((L - pr.total) / S.sdTotal);
+      const p = adjustedProbability(pr, "total", L).above;
       ouRows += `<tr class="${Math.abs(L - pr.total) < 1.01 ? 'near' : ''}"><td>${L.toFixed(1)}</td><td>${(p * 100).toFixed(1)}%</td><td>${(1 / p).toFixed(2)}</td><td>${((1 - p) * 100).toFixed(1)}%</td><td>${(1 / (1 - p)).toFixed(2)}</td></tr>`;
     }
     $('#lineTables').innerHTML = `
@@ -464,14 +467,7 @@
   }
 
   // Normal approximation to integer scores: equality occupies a one-point bin.
-  function marketProb(mean, sd, threshold) {
-    if (![mean, sd, threshold].every(Number.isFinite) || sd <= 0) return null;
-    const integer = Number.isInteger(threshold);
-    const lower = integer ? threshold - 0.5 : Math.floor(threshold) + 0.5;
-    const upper = integer ? threshold + 0.5 : lower;
-    const below = Phi((lower - mean) / sd), above = 1 - Phi((upper - mean) / sd);
-    return {above, below, equal: Math.max(0, 1 - below - above)};
-  }
+  function marketProb(mean, sd, threshold) { return F.probabilities(mean, sd, threshold); }
   function scenarioPrediction(out, minutes, options = state) {
     return predict(state.home, state.away, {neutral: options.neutral, b2bH: options.b2bH,
       b2bA: options.b2bA, adjH: options.adjH, adjA: options.adjA, minutes,
@@ -489,8 +485,8 @@
       const p = x.prediction;
       const action = i > 1 ? `<button class="ghost small" data-remove="${i-2}">삭제</button>` : '';
       if (!p.valid || state.home === state.away) return `<tr><td>${esc(x.name)} ${action}</td><td colspan="7">240분 배분 / 팀 선택 확인 필요</td></tr>`;
-      const hp = hc === null ? null : marketProb(p.margin, S.sdMargin, -hc);
-      const op = ou === null ? null : marketProb(p.total, S.sdTotal, ou);
+      const hp = hc === null ? null : adjustedProbability(p, "margin", -hc);
+      const op = ou === null ? null : adjustedProbability(p, "total", ou);
       const probability = v => v ? `${pct(v.above)}% / ${pct(v.below)}% / ${pct(v.equal)}%` : '기준점 입력';
       return `<tr><td>${esc(x.name)} ${action}</td><td>${p.pa.toFixed(1)} : ${p.ph.toFixed(1)}</td>
         <td>${signed(p.margin)}<br><small>변화 ${base.valid ? signed(p.margin-base.margin) : '–'}</small></td>
@@ -498,7 +494,7 @@
         <td>${hc === null ? '–' : signed(p.margin+hc)}</td><td>${ou === null ? '–' : signed(p.total-ou)}</td>
         <td>${probability(hp)}</td><td>${probability(op)}</td></tr>`;
     }).join('');
-    $('#scenarioNote').textContent = '현재 입력한 기준점과 모델 설정으로 비교합니다. 저장한 시나리오는 결장·출전시간·홈/백투백·직접 보정을 보존합니다. 확률 순서: 홈 핸디 승/패/동점, 오버/언더/동점. 과거 성능으로 보정하지 않은 모델 추정입니다.';
+    $('#scenarioNote').textContent = '현재 입력한 기준점과 모델 설정으로 비교합니다. 저장한 시나리오는 결장·출전시간·홈/백투백·직접 보정을 보존합니다. 확률 순서: 홈 핸디 승/패/동점, 오버/언더/동점. 점수는 원모델 추정, 확률은 보정 상태에 표시된 설정입니다.';
   }
   $('#saveScenario').addEventListener('click', () => {
     if (!lastPred || !lastPred.valid || state.home === state.away) return;
@@ -523,7 +519,7 @@
       <p>${Object.keys(D.teams).length}개 팀 · ${D.players.length}명 · 이번 시즌 기록 없음 ${noCurrent}명 · 두 시즌 모두 없음 ${missing.length}명 · 중복 통계 ID ${duplicates.length}건</p>
       <details><summary>통계 없는 선수 / 확인 사항</summary><p>${missing.map(p => esc(p.name)+' ('+esc(p.team)+')').join(', ')}</p>
       <p>미출전·신인·수집 실패를 아직 자동 구분하지 않습니다. 부상 보고 시각은 선수 상태에 마우스를 올리면 확인할 수 있습니다. 자료 시각과 부상 보고 시각은 서로 다릅니다.</p></details>
-      <p class="muted">확률은 고정 변동폭을 사용한 추정입니다. 총점·점수차 변화와 데이터 상태를 함께 확인하세요.</p>`;
+      <p class="muted">실력은 작년 중심, 예상 출전시간은 현재 시즌 역할 중심입니다. 확률의 보정 여부는 분석 패널에서 확인하세요. 총점·점수차 변화와 데이터 상태를 함께 확인하세요.</p>`;
   }
 
   // ---------- 로스터 / 부상자 선택 ----------
@@ -566,14 +562,14 @@
       body += `<tr class="${out ? 'out' : ''}">
         <td class="t keep"><input type="checkbox" data-eid="${esc(p.eid)}" ${out ? 'checked' : ''} title="결장 처리"></td>
         <td class="t sticky">${esc(p.name)} <small>${esc(p.pos)}</small></td>
-        <td class="t keep">${statusChip(p)}${!p.cur && !p.prev ? '<span class=chip>통계 없음 · 추정</span>' : !p.cur ? '<span class=chip>지난 시즌만</span>' : ''}</td>
+        <td class="t keep">${statusChip(p)}<br><small>평가 혼합: 이번 ${(F.currentWeight(p.cur,p.prev)*100).toFixed(0)}% / 작년 ${((1-F.currentWeight(p.cur,p.prev))*100).toFixed(0)}%${!p.prev ? " · 작년 자료 없음, 역할 평균 보완" : ""}</small>${!p.cur && !p.prev ? '<span class=chip>통계 없음 · 추정</span>' : !p.cur ? '<span class=chip>지난 시즌만</span>' : ''}</td>
         <td>${minCell}<br><input class=minutes type=number min=0 max=40 step=0.5 data-minutes="${esc(p.eid)}" aria-label="${esc(p.name)} 예상 출전시간" placeholder="자동" value="${minuteOverrides[p.eid] ?? ''}" ${out ? 'disabled' : ''}></td>
         <td>${fmt(s.pts)}</td><td>${fmt(s.trb)}</td><td>${fmt(s.ast)}</td><td>${fmt(s.stl)}</td><td>${fmt(s.blk)}</td>
         <td>${pct(s.fg_pct)}</td><td>${pct(s.fg3_pct)}</td><td>${fmt(s.bpm)}</td>
         <td class="keep">${impact}</td></tr>`;
     });
     el.innerHTML = `
-      <h3><span>${side === 'home' ? '홈' : '원정'} · ${esc(tName(team))}</span><small>체크 = 결장 처리 · 수치는 이번+지난 시즌 혼합</small></h3>
+      <h3><span>${side === 'home' ? '홈' : '원정'} · ${esc(tName(team))}</span><small>체크 = 결장 처리 · 통계는 시즌 평균 혼합 · 출전시간은 현재 역할 별도 추정</small></h3>
       <p class="rotation-total">출전 합계 ${cur.totalMinutes.toFixed(1)} / 240분 ${cur.valid ? "✓" : "— 시간 조정 필요"} · 입력한 분은 고정, 빈칸은 자동 배분 (최대 40분). 통계 없는 선수도 직접 시간을 지정할 수 있습니다.</p><div class="lost">${outs.length ? `결장 <b>${outs.length}명</b>: ${outs.map(p => esc(p.name)).join(', ')}<br>
         빠지는 기록 합계 <b>${lostPts.toFixed(1)}점 · ${lostReb.toFixed(1)}리바 · ${lostAst.toFixed(1)}어시</b> (출전 ${lostMin.toFixed(0)}분)
         → 다른 선수가 메운 뒤 예상 영향: 팀 득점 <b class="${teamPtsEffect < 0 ? 'diff-neg' : ''}">${signed(teamPtsEffect)}</b>, 상대 득점 <b class="${oppPtsEffect > 0 ? 'diff-neg' : ''}">${signed(oppPtsEffect)}</b>` : '결장자 없음 (체크박스로 지정하세요)'}</div>
@@ -808,29 +804,146 @@
       <li>각 선수의 <b>OBPM/DBPM</b>(100포제션당 공격·수비 기여도)에 바뀐 출전 시간을 곱해 팀 전력을 다시 계산합니다. 그래서 주전이 빠지면 벤치 선수가 시간을 더 받는 효과까지 들어갑니다.</li>
       <li>단순히 "그 선수 평균 득점만큼 빠진다"가 아니라, 대체 선수가 일부를 메운 뒤의 순수 손실을 계산합니다. 로스터 표의 <b>결장 영향</b> 열이 그 선수 혼자 빠질 때의 점수차 변화입니다.</li>
       <li>ESPN 부상자 명단에서 '결장(Out)'인 선수는 자동으로 체크됩니다. 체크박스로 직접 바꿀 수 있고, 바꾼 내용은 이 브라우저에 저장됩니다.</li>
-      <li>출전 시간이 적은 선수의 BPM은 평균 이하 쪽으로 당겨서 계산합니다 (몇 경기 반짝 기록에 휘둘리지 않도록).</li>
+      <li>실력 평가는 20경기·평균 15분 전에는 작년 중심입니다 (이번 시즌 최대 15%, 150분 미만이면 더 낮게). 두 조건 또는 누적 600분 이후에는 비중을 점진적으로 늘립니다. BPM 표본이 적으면 작년 기록이 충분한 같은 포지션 선수들의 평균으로 보완합니다.</li>
     </ul>
     <h3>3. 점수와 확률</h3>
     <ul>
       <li>예상 득점 = (리그 평균 효율 + 우리 공격 − 상대 수비) × 예상 페이스 ÷ 100, 여기에 홈 어드밴티지(${S.hca}점)와 백투백(${S.b2b}점), 직접 보정을 더합니다.</li>
       <li>승리 확률은 실제 점수차가 예상에서 표준편차 ${S.sdMargin}점 정도로 흔들린다고 보고 계산합니다 (정규분포). 언더오버는 총점 표준편차 ${S.sdTotal}점을 씁니다.</li>
-      <li><b>기대값</b> = 모델 확률 × 배당 − 1. +5%면 1만 원당 평균 500원 이득이라는 뜻이지만, 정수 기준점은 동점 확률과 선택한 정산 규칙을 추가로 반영합니다. 모델 확률은 과거 경기로 검증되지 않았습니다.</li>
+      <li><b>기대값</b> = 모델 확률 × 배당 − 1. +5%면 1만 원당 평균 500원 이득이라는 뜻이지만, 정수 기준점은 동점 확률과 선택한 정산 규칙을 추가로 반영합니다. 원모델 확률은 검증 전 추정입니다. 동일 모델·설정의 경기 전 기록으로 학습 100경기와 후속 검증 30경기 이상을 확보하고, 오차·분포·확률 검증을 통과한 항목만 보정을 적용합니다.</li>
     </ul>
     <h3>4. 한계</h3>
     <ul>
       <li>시즌 초반에는 이번 시즌 표본이 적어서 지난 시즌 기록 비중이 큽니다.</li>
       <li>코칭, 동기 부여, 경기 당일 컨디션, 출전 제한은 로스터의 예상 출전시간으로 지정하세요. 포지션별 대체와 라인업 효과는 자동으로 판단하지 못합니다.</li>
-      <li>이름 표기가 달라 통계가 연결되지 않은 선수(주로 신인)는 자동 출전시간은 0입니다. 직접 시간을 입력하면 평균 이하 사전 평가값으로 계산됩니다.</li>
+      <li>이름 표기가 달라 통계가 연결되지 않은 선수(주로 신인)는 자동 출전시간은 0입니다. 직접 시간을 입력하면 포지션별 사전 평가값으로 계산됩니다.</li>
       <li>해외 시장 라인과 큰 차이가 나면 모델이 모르는 정보(부상 소식 등)가 있을 가능성도 생각하세요.</li>
     </ul>
     <h3>데이터 업데이트</h3>
     <p>폴더 안의 <code>시작하기.command</code>를 더블클릭하거나 터미널에서 <code>python3 update_data.py</code>를 실행하면 최신 통계·부상자·일정을 받아옵니다. 경기 전날·당일에 한 번씩 업데이트하는 걸 추천해요.</p>`;
+
+  // Immutable pregame snapshots; result entry is separate from the prediction.
+  const loadedHistory = load('forecast_history_v2', []);
+  let history = Array.isArray(loadedHistory) ? loadedHistory.filter(F.validRecord) : [];
+  let calibrationSnapshot = null;
+  function modelSignature() {
+    return F.VERSION + '/' + CUR + '/' + JSON.stringify(Object.fromEntries(Object.keys(DEFAULTS).sort().filter(k=>k!=='dtdOut').map(k=>[k,S[k]])));
+  }
+  function refreshCalibration() {
+    const game = games.find(g=>g.id===state.gameId);
+    const cutoff = Math.min(Date.now(), game ? Date.parse(game.date) : Infinity);
+    const signature = modelSignature();
+    calibrationSnapshot = {margin:F.calibrate(history,signature,'margin',cutoff), total:F.calibrate(history,signature,'total',cutoff)};
+  }
+  function adjustedProbability(pr, kind, threshold) {
+    const c = calibrationSnapshot?.[kind];
+    return F.probabilities(pr[kind] + (c?.bias || 0), c?.sd || S[kind==='margin'?'sdMargin':'sdTotal'], threshold);
+  }
+  function calibrationText(kind, c) {
+    const title = kind === 'margin' ? '핸디캡' : '언더오버';
+    let status = c.applied ? '별도 검증 통과 · 경험적 오차 보정 적용' : c.reason === 'waiting' ? '표본 부족 · 보정 전' : c.reason === 'chronology' ? '시간 순서상 학습 자료 부족 · 보정 전' : '검증 개선 조건 미충족 · 보정 전';
+    let detail = `${c.n}경기 (동일 모델·설정, 경기당 1건)`;
+    if (c.before) detail += ` · 학습 ${c.trainN} / 후속 검증 ${c.holdN} · 검증 MAE ${c.before.mae.toFixed(2)} → ${c.after.mae.toFixed(2)}점 · 확률 검증 ${c.after.lineCount}건 · Brier ${c.before.brier == null ? '–' : c.before.brier.toFixed(3)} → ${c.after.brier == null ? '–' : c.after.brier.toFixed(3)}`;
+    if (c.applied) detail += ` · 평균 보정 ${signed(c.bias)}점 / 오차 표준편차 ${c.sd.toFixed(1)}점`;
+    return `<p><b>${title}: ${status}</b><br><small>${detail}</small></p>`;
+  }
+  function renderCalibration() {
+    $('#calibrationStatus').innerHTML = ['margin','total'].map(k=>calibrationText(k,calibrationSnapshot[k])).join('') +
+      '<p class="muted">학습 100경기 + 이후 검증 30경기 이상에서 분포 오차·평균 절대오차·기준점 확률을 비교합니다. 보정 전에는 기존 변동폭을 유지하며 임의로 확률을 낮추지 않습니다. 점수 표시와 승패 확률은 원모델입니다.</p>';
+  }
+  function persistHistory(next) {
+    try {
+      localStorage.setItem('nbatoto_forecast_history_v2', JSON.stringify(next));
+      history = next;
+      return true;
+    } catch (_) {
+      $('#recordMessage').textContent = '브라우저 저장 실패. 기록을 백업하고 저장 공간/권한을 확인하세요.';
+      $('#historyMessage').textContent = '저장 실패: 변경 내용을 보관하지 못했습니다.';
+      return false;
+    }
+  }
+  $('#recordPrediction').addEventListener('click', () => {
+    const message = $('#recordMessage'), game = games.find(g=>g.id===state.gameId);
+    const now = new Date();
+    if (!game || game.state !== 'pre' || !(Date.parse(game.date) > now.getTime())) {
+      message.textContent = '시작 전 일정에서 경기를 선택해야 기록할 수 있습니다. 지난 경기를 소급 저장하지 않습니다.'; return;
+    }
+    if (!lastPred?.valid || state.home === state.away) { message.textContent='출전시간·팀 선택을 먼저 확인하세요.'; return; }
+    if (history.some(r=>r.gameId===game.id)) { message.textContent='이미 기록한 경기입니다. 최초 예측을 유지합니다.'; return; }
+    const hc = num('hcLine'), ou = num('ouLine');
+    if (hc == null && ou == null) { message.textContent='핸디 또는 총점 기준점을 하나 이상 입력하세요.'; return; }
+    if (history.length >= 2000) { message.textContent='기록 한도(2,000경기)에 도달했습니다. 백업 후 저장 공간을 정리하세요.'; return; }
+    const snapshot = (teamModel) => ({off:teamModel.off, def:teamModel.def, pace:teamModel.pace,
+      rotation:teamModel.rot.list.map(x=>({eid:x.p.eid, name:x.p.name, minutes:x.final, out:!!x.out, ability:modelBPM(x.p), currentWeight:F.currentWeight(x.p.cur,x.p.prev)}))});
+    const record = {id:crypto.randomUUID(), gameId:game.id, version:F.VERSION, signature:modelSignature(), savedAt:now.toISOString(), start:game.date,
+      home:state.home, away:state.away, dataUpdated:D.updated, settings:{...S}, overrides:{...overrides}, minutes:{...minuteOverrides},
+      options:{neutral:state.neutral,b2bH:state.b2bH,b2bA:state.b2bA,adjH:state.adjH,adjA:state.adjA},
+      raw:{margin:lastPred.margin,total:lastPred.total,sdMargin:S.sdMargin,sdTotal:S.sdTotal},
+      lines:{margin:hc==null?null:-hc,total:ou}, settlement:$('#settlement').value,
+      odds:{home:num('oddHcH'),away:num('oddHcA'),over:num('oddOver'),under:num('oddUnder')},
+      applied:{margin:hc==null?null:adjustedProbability(lastPred,'margin',-hc),total:ou==null?null:adjustedProbability(lastPred,'total',ou)},
+      calibration:JSON.parse(JSON.stringify(calibrationSnapshot)), teams:{home:snapshot(lastPred.H),away:snapshot(lastPred.A)},result:null};
+    if (persistHistory([...history,record])) {
+      message.textContent='경기 전 예측을 저장했습니다. 예측 기록 · 검증 탭에서 정규시간 결과를 입력하세요.';
+      renderHistory();
+    }
+  });
+  function renderHistory() {
+    $('#historySummary').innerHTML = `<p>저장 ${history.length}경기 · 결과 입력 ${history.filter(r=>r.result).length}경기. 아래는 최근 100건입니다. 전체 기록은 백업에 포함됩니다. 결과는 사용자가 입력한 정규시간 점수입니다.</p>` +
+      ['margin','total'].map(k=>calibrationText(k,F.calibrate(history,modelSignature(),k))).join('');
+    $('#historyTable').innerHTML = history.length ? `<table class="grid history-grid"><thead><tr><th>경기 / 기록 시각</th><th>당시 예측·기준점</th><th>당시 적용 확률</th><th>정규시간 결과</th></tr></thead><tbody>${history.slice().sort((a,b)=>Date.parse(b.start)-Date.parse(a.start)).slice(0,100).map(r=>{
+      const final = r.result;
+      const probs = (kind) => r.applied?.[kind] && Number.isFinite(r.applied[kind].above) ? `${pct(r.applied[kind].above)}% / ${pct(r.applied[kind].below)}% / ${pct(r.applied[kind].equal)}%` : '–';
+      return `<tr><td>${esc(r.away)} @ ${esc(r.home)}<br>${esc(kst(r.start))}<br><small>저장 ${esc(kst(r.savedAt))}</small></td>
+        <td>홈 점수차 ${signed(r.raw.margin)} / 총점 ${r.raw.total.toFixed(1)}<br>홈 핸디 ${Number.isFinite(r.lines?.margin)?signed(-r.lines.margin):'–'} / O/U ${Number.isFinite(r.lines?.total)?r.lines.total:'–'}</td>
+        <td>핸디 승/패/동점 ${probs('margin')}<br>오버/언더/동점 ${probs('total')}</td>
+        <td><form data-result-id="${esc(r.id)}"><label>원정 <input name="awayScore" type="number" min="0" max="300" step="1" required value="${final?.away ?? ''}"></label>
+          <label>홈 <input name="homeScore" type="number" min="0" max="300" step="1" required value="${final?.home ?? ''}"></label>
+          <label class="chk"><input name="regulation" type="checkbox" required> 4쿼터 종료 점수 확인</label><button>${final?'결과 수정':'결과 저장'}</button></form>
+          ${final?`<small>원예측 오차: 점수차 ${signed(final.home-final.away-r.raw.margin)} / 총점 ${signed(final.home+final.away-r.raw.total)}점</small>`:''}</td></tr>`;
+    }).join('')}</tbody></table>` : '<p>아직 기록이 없습니다. 경기 예측 탭에서 시작 전 예측을 먼저 저장하세요.</p>';
+  }
+  $('#historyTable').addEventListener('submit', e => {
+    e.preventDefault();
+    const form=e.target.closest('[data-result-id]'); if(!form || !form.reportValidity()) return;
+    const r=history.find(x=>x.id===form.dataset.resultId), now=new Date();
+    if(!r || Date.parse(r.start)>=now.getTime()) { $('#historyMessage').textContent='경기 시작 전에는 결과를 입력할 수 없습니다.'; return; }
+    const home=Number(form.elements.homeScore.value), away=Number(form.elements.awayScore.value);
+    if(![home,away].every(x=>Number.isInteger(x)&&x>=0&&x<=300)) return;
+    const next={...r,result:{home,away,basis:'regulation',recordedAt:now.toISOString(),source:'manual'}};
+    if (persistHistory(history.map(x=>x.gameId===r.gameId?next:x))) {
+      $('#historyMessage').textContent='정규시간 결과를 저장했습니다. 당시 예측은 그대로 보존했습니다.';
+      renderHistory(); renderPredict();
+    }
+  });
+  $('#exportHistory').addEventListener('click', () => {
+    const blob=new Blob([JSON.stringify({schema:2,records:history},null,2)],{type:'application/json'});
+    const url=URL.createObjectURL(blob), a=document.createElement('a');
+    a.href=url;a.download='nba-predictions-'+new Date().toISOString().slice(0,10)+'.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+  });
+  $('#importHistory').addEventListener('change', async e => {
+    const file=e.target.files[0];if(!file) return;
+    try {
+      if(file.size>20*1024*1024) throw new Error('백업 파일은 20MB 이하여야 합니다.');
+      const data=JSON.parse(await file.text());
+      if(data.schema!==2 || !Array.isArray(data.records) || data.records.length>2000 || !data.records.every(F.validRecord)) throw new Error('지원하지 않거나 유효하지 않은 예측 백업입니다.');
+      const merged=[...history], gamesSeen=new Set(history.map(r=>r.gameId)), idsSeen=new Set(history.map(r=>r.id));
+      for(const r of data.records){if(!gamesSeen.has(r.gameId)){
+        if(idsSeen.has(r.id)) throw new Error('서로 다른 경기에 같은 기록 ID가 있습니다.');
+        merged.push(r);gamesSeen.add(r.gameId);idsSeen.add(r.id);
+      }}
+      if(merged.length>2000) throw new Error('합친 기록이 2,000경기를 초과합니다.');
+      if(persistHistory(merged)){ $('#historyMessage').textContent='백업을 합쳤습니다. 중복 경기의 기존 기록은 유지했습니다.';renderHistory();renderPredict(); }
+    } catch(err){$('#historyMessage').textContent=err.message;}
+    e.target.value='';
+  });
 
   // ---------- 시작 ----------
   function renderAll() {
     renderGames(); renderPredict();
     if (state.tab === 'players') renderPlayers();
     if (state.tab === 'teams') renderTeams();
+    if (state.tab === 'history') renderHistory();
   }
   recenter();
   renderQuality();

@@ -1,6 +1,6 @@
 const fs=require('node:fs'), vm=require('node:vm'), assert=require('node:assert/strict');
 const path=require('node:path'); process.chdir(path.join(__dirname,'..'));
-const context={window:{},document:{getElementById:()=>({})},localStorage:{getItem:()=>null},assert,console};
+const context={NBAForecast:require('../forecast.js'),window:{},document:{getElementById:()=>({})},localStorage:{getItem:()=>null},assert,console};
 vm.runInNewContext(fs.readFileSync('data/nba_data.js','utf8'),context);
 const src=fs.readFileSync('app.js','utf8');
 const model=src.slice(src.indexOf('  const D ='),src.indexOf('  // ---------- 경기 일정'));
