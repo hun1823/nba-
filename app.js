@@ -59,7 +59,21 @@
     ['rosterW', '로스터 기반 비중 (0~1)', 0.05, '시즌 전 기준값에서 "현재 로스터 선수 능력" 대 "지난 시즌 팀 성적" 비율.'],
   ];
   let S = Object.assign({}, DEFAULTS, load('settings', {}));
-  let overrides = load('overrides', {}); // eid -> true(결장) / false(출전)
+  Object.keys(DEFAULTS).forEach(k => { if (k !== 'dtdOut' && (!Number.isFinite(S[k]) || S[k] < 0 || (['sdMargin','sdTotal','teamK'].includes(k) && S[k] === 0) || (k === 'rosterW' && S[k] > 1))) S[k] = DEFAULTS[k]; });
+  let overrides = {};
+  let minuteOverrides = {};
+  let scenarioScope = '';
+  let scenarios = [];
+  const scopeKey = () => [D.updated, state.gameId || 'manual', state.home, state.away].join('|');
+  function activateScope() {
+    const key = scopeKey();
+    if (scenarioScope === key) return;
+    scenarioScope = key;
+    const saved = load('matchup_' + key, {});
+    overrides = saved.out || {}; minuteOverrides = saved.minutes || {}; scenarios = saved.scenarios || [];
+  }
+  function saveMatchup() { save('matchup_' + scenarioScope, {out: overrides, minutes: minuteOverrides, scenarios}); }
+  // // eid -> true(결장) / false(출전)
 
   const defaultOut = p => !!(p.injury && (p.injury.status === 'Out' || (S.dtdOut && p.injury.status === 'Day-To-Day')));
   const isOut = p => (p.eid in overrides) ? overrides[p.eid] : defaultOut(p);
@@ -125,7 +139,7 @@
   // 2) 결장자의 시간은 남은 선수에게 m×(40−현재 시간) 가중치로 나눔
   //    → 이미 35분 뛰는 주전보다 로테이션·벤치 선수가 더 많이 받음
   const MAX_MIN = 40;
-  function rotation(team, outFn) {
+  function rotation(team, outFn, minutes = {}) {
     const list = (byTeam[team] || []).map(p => ({ p, m: Math.min(MAX_MIN, projMin(p)), final: 0 }));
     const sorted = list.filter(x => x.m > 0).sort((a, b) => b.m - a.m);
     const sumM = sorted.reduce((s, x) => s + x.m, 0);
@@ -137,24 +151,36 @@
       sorted.forEach(x => { x.final = Math.max(0, Math.min(x.m, 240 - cum)); cum += x.final; });
     }
     list.forEach(x => { x.base = x.final; });
-    let freed = 0;
-    list.forEach(x => { if (outFn(x.p)) { freed += x.final; x.final = 0; x.out = true; } });
-    for (let it = 0; it < 12 && freed > 0.01; it++) {
-      const cand = list.filter(x => !x.out && x.m > 0 && x.final < MAX_MIN - 0.01);
-      const wsum = cand.reduce((s, x) => s + x.m * (MAX_MIN - x.final), 0);
-      if (!wsum) break;
-      let left = 0;
-      cand.forEach(x => {
-        const add = freed * x.m * (MAX_MIN - x.final) / wsum;
-        const room = MAX_MIN - x.final;
-        x.final += Math.min(add, room);
-        left += Math.max(0, add - room);
-      });
-      freed = left;
+    list.forEach(x => {
+      x.out = outFn(x.p);
+      x.fixed = x.out || Object.hasOwn(minutes, x.p.eid);
+      x.final = x.out ? 0 : x.fixed ? Number(minutes[x.p.eid]) : x.base;
+    });
+    const invalidInput = list.some(x => !Number.isFinite(x.final) || x.final < 0 || x.final > MAX_MIN);
+    let remaining = 240 - list.reduce((n, x) => n + x.final, 0);
+    const candidates = list.filter(x => !x.fixed && x.m > 0);
+    if (remaining < 0) {
+      const flexible = candidates.reduce((n, x) => n + x.final, 0);
+      const scale = flexible > 0 ? Math.max(0, (flexible + remaining) / flexible) : 0;
+      candidates.forEach(x => { x.final *= scale; });
+      remaining = 240 - list.reduce((n, x) => n + x.final, 0);
     }
+    for (let it = 0; it < list.length && remaining > 0.001; it++) {
+      const eligible = candidates.filter(x => x.final < MAX_MIN - 0.001);
+      const weight = eligible.reduce((n, x) => n + x.m * (MAX_MIN - x.final), 0);
+      if (!weight) break;
+      let used = 0;
+      eligible.forEach(x => {
+        const add = Math.min(MAX_MIN - x.final, remaining * x.m * (MAX_MIN - x.final) / weight);
+        x.final += add; used += add;
+      });
+      remaining -= used;
+    }
+    const totalMinutes = list.reduce((n, x) => n + x.final, 0);
+    const valid = !invalidInput && Math.abs(totalMinutes - 240) < 0.01;
     let off = 0, def = 0;
     list.forEach(x => { const b = modelBPM(x.p); off += b.ob * x.final / 48; def += b.db * x.final / 48; });
-    return { list, off, def };
+    return { list, off, def, totalMinutes, valid };
   }
 
   const healthyCache = {};
@@ -181,8 +207,8 @@
   }
 
   // 팀 모델: off/def = 리그 평균 대비 100포제션당 (+ 좋음)
-  function teamModel(team, outFn) {
-    const h = healthy(team), r = rotation(team, outFn);
+  function teamModel(team, outFn, minutes = {}) {
+    const h = healthy(team), r = rotation(team, outFn, minutes);
     const tc = teamRow(CUR, team), tp = teamRow(PREV, team);
     const lc = league(CUR), lp = league(PREV);
     const g = teamG(CUR, team), wa = g / (g + S.teamK);
@@ -202,7 +228,7 @@
   function predict(home, away, o) {
     o = o || {};
     const outFn = o.outFn || isOut;
-    const H = teamModel(home, outFn), A = teamModel(away, outFn);
+    const H = teamModel(home, outFn, o.minutes || {}), A = teamModel(away, outFn, o.minutes || {});
     const L = leagueBase();
     const pace = H.pace * A.pace / L.pace;
     const rawH = (L.ortg + H.off - A.def) * pace / 100;
@@ -214,7 +240,7 @@
     if (o.b2bA) { pa -= S.b2b * 2 / 3; ph += S.b2b / 3; }
     ph += o.adjH || 0; pa += o.adjA || 0;
     const margin = ph - pa, total = ph + pa;
-    return { H, A, L, pace, ph, pa, margin, total, pHome: Phi(margin / S.sdMargin), hca };
+    return { valid: H.rot.valid && A.rot.valid, H, A, L, pace, ph, pa, margin, total, pHome: Phi(margin / S.sdMargin), hca };
   }
 
   // ---------- 경기 일정 ----------
@@ -247,6 +273,7 @@
 
   // ---------- 경기 목록 ----------
   function renderGames() {
+    activateScope();
     const showFinal = $('#showFinal').checked;
     const list = games.filter(g => showFinal || g.state !== 'post');
     if (!list.length) { $('#gamesList').innerHTML = '<div class="muted" style="padding:10px">표시할 경기가 없어요. 위에서 팀을 직접 고르세요.</div>'; return; }
@@ -313,14 +340,15 @@
     const hc = parseFloat($('#hcLine').value); if (!isNaN(hc)) $('#hcLine').value = -hc;
     state.gameId = null; syncPickers(); renderGames(); renderPredict();
   });
-  $('#resetInj').addEventListener('click', () => { overrides = {}; save('overrides', overrides); renderAll(); });
+  $('#resetInj').addEventListener('click', () => { overrides = {}; minuteOverrides = {}; saveMatchup(); renderAll(); });
   ['oddAway', 'oddHome', 'hcLine', 'oddHcH', 'oddHcA', 'ouLine', 'oddOver', 'oddUnder'].forEach(id => $('#' + id).addEventListener('input', () => renderCalc(lastPred)));
 
   // ---------- 예측 결과 ----------
   let lastPred = null;
   function renderPredict() {
     if (!state.home || !state.away) return;
-    const pr = predict(state.home, state.away, { neutral: state.neutral, b2bH: state.b2bH, b2bA: state.b2bA, adjH: state.adjH, adjA: state.adjA });
+    activateScope();
+    const pr = predict(state.home, state.away, { neutral: state.neutral, b2bH: state.b2bH, b2bA: state.b2bA, adjH: state.adjH, adjA: state.adjA, minutes: minuteOverrides });
     lastPred = pr;
     const g = games.find(x => x.id === state.gameId);
     const pA = 1 - pr.pHome;
@@ -374,6 +402,7 @@
         </table>
         <p>리그 평균 공격 효율 ${pr.L.ortg.toFixed(1)}점/100포제션 기준. 예상 득점 = (리그 평균 + 우리 공격 − 상대 수비) × 페이스 ÷ 100 + 홈/백투백/보정.</p>
       </details>`;
+    if (!pr.valid || state.home === state.away) $('#result').innerHTML = '<p class=quality-warning>예측 보류: 서로 다른 팀을 선택하고 양 팀 출전시간을 각각 240분으로 맞춰 주세요.</p>';
     renderCalc(pr);
     renderRoster('away', state.away, pr.A, pr);
     renderRoster('home', state.home, pr.H, pr);
@@ -383,40 +412,43 @@
   const num = id => { const v = parseFloat($('#' + id).value); return isNaN(v) ? null : v; };
   function betRows(items) {
     // items: [{pick, p, odds}]
-    const implied = items.every(x => x.odds) ? items.reduce((s, x) => s + 1 / x.odds, 0) : null;
-    let h = '<div class="bet"><span class="h">선택</span><span class="h">모델 확률</span><span class="h">공정 배당</span><span class="h">기대값</span>';
+    const rule = $('#settlement').value;
+    let h = '<div class="bet"><span class="h">선택</span><span class="h">모델 확률</span><span class="h">모델 공정 배당</span><span class="h">모델 기대값</span>';
     items.forEach(x => {
-      let ev = '<span class="muted">배당 입력</span>';
-      if (x.odds) {
-        const v = x.p * x.odds - 1;
-        const imp = implied ? (1 / x.odds) / implied : 1 / x.odds;
-        ev = `<span class="ev ${v > 0 ? 'pos' : 'neg'}" title="배당 기준 확률 ${(imp * 100).toFixed(1)}%">${v > 0 ? '+' : ''}${(v * 100).toFixed(1)}%</span>`;
-      }
-      h += `<span class="pick">${esc(x.pick)}</span><span>${(x.p * 100).toFixed(1)}%</span><span>${(1 / x.p).toFixed(2)}</span>${ev}`;
+      const equal = x.equal || 0;
+      const unresolved = equal > 0 && rule === 'unknown';
+      const refund = rule === 'refund' ? equal : 0;
+      const validOdds = Number.isFinite(x.odds) && x.odds > 1;
+      const fair = unresolved ? '정산 선택' : x.p > 0 ? ((1-refund)/x.p).toFixed(2) : '–';
+      const ev = unresolved ? '정산 선택' : validOdds ? signed((x.p*x.odds + refund - 1)*100) + '%' : '배당 > 1 입력';
+      h += `<span>${esc(x.pick)}</span><span>${pct(x.p)}%</span><span>${fair}</span><span>${ev}</span>`;
     });
     h += '</div>';
-    if (implied) h += `<div class="muted" style="margin-top:4px">환수율 ${(100 / implied).toFixed(1)}% · 기대값이 +면 모델 기준으로 배당이 후한 편</div>`;
+    if (items[0].equal > 0) h += `<p class="muted">기준점과 같을 확률 ${pct(items[0].equal)}%. 동점 정산 규칙을 선택해야 배당·기대값을 계산합니다.</p>`;
     return h;
   }
+
   function renderCalc(pr) {
     if (!pr) return;
+    renderScenarios();
+    if (!pr.valid || state.home === state.away) { ['outML','outHC','outOU','lineTables'].forEach(id => $('#' + id).innerHTML = '출전시간 또는 팀 선택을 확인하세요.'); return; }
     const pH = pr.pHome, pA = 1 - pH;
     $('#outML').innerHTML = betRows([{ pick: state.away + ' 승', p: pA, odds: num('oddAway') }, { pick: state.home + ' 승', p: pH, odds: num('oddHome') }]);
     const hc = num('hcLine');
     if (hc != null) {
-      const pc = Phi((pr.margin + hc) / S.sdMargin);
-      $('#outHC').innerHTML = betRows([{ pick: `${state.home} ${signed(hc)} 핸디 승`, p: pc, odds: num('oddHcH') }, { pick: `${state.away} ${signed(-hc)} (핸디 패)`, p: 1 - pc, odds: num('oddHcA') }]);
+      const hp = marketProb(pr.margin, S.sdMargin, -hc), pc = hp.above;
+      $('#outHC').innerHTML = betRows([{ pick: `${state.home} ${signed(hc)} 핸디 승`, p: pc, equal: hp.equal, odds: num('oddHcH') }, { pick: `${state.away} ${signed(-hc)} (핸디 패)`, p: hp.below, equal: hp.equal, odds: num('oddHcA') }]);
     } else $('#outHC').innerHTML = '<div class="muted">홈 핸디 기준점을 입력하세요.</div>';
     const ou = num('ouLine');
     if (ou != null) {
-      const po = 1 - Phi((ou - pr.total) / S.sdTotal);
-      $('#outOU').innerHTML = betRows([{ pick: `오버 ${ou}`, p: po, odds: num('oddOver') }, { pick: `언더 ${ou}`, p: 1 - po, odds: num('oddUnder') }]);
+      const op = marketProb(pr.total, S.sdTotal, ou), po = op.above;
+      $('#outOU').innerHTML = betRows([{ pick: `오버 ${ou}`, p: po, equal: op.equal, odds: num('oddOver') }, { pick: `언더 ${ou}`, p: op.below, equal: op.equal, odds: num('oddUnder') }]);
     } else $('#outOU').innerHTML = '<div class="muted">기준점을 입력하세요.</div>';
 
     // 기준점별 확률표
     let hcRows = '';
     for (let i = -6; i <= 6; i++) {
-      const L = Math.floor(-pr.margin) + 0.5 + i * 1.5;
+      const L = Math.floor(-pr.margin) + 0.5 + i * 1;
       const p = Phi((pr.margin + L) / S.sdMargin);
       hcRows += `<tr class="${Math.abs(L + pr.margin) < 0.76 ? 'near' : ''}"><td>${esc(state.home)} ${signed(L)}</td><td>${(p * 100).toFixed(1)}%</td><td>${(1 / p).toFixed(2)}</td><td>${((1 - p) * 100).toFixed(1)}%</td><td>${(1 / (1 - p)).toFixed(2)}</td></tr>`;
     }
@@ -431,13 +463,76 @@
       <div><h4>언더오버 기준점별 확률</h4><table class="mini"><tr><th>기준점</th><th>오버</th><th>공정배당</th><th>언더</th><th>공정배당</th></tr>${ouRows}</table></div>`;
   }
 
+  // Normal approximation to integer scores: equality occupies a one-point bin.
+  function marketProb(mean, sd, threshold) {
+    if (![mean, sd, threshold].every(Number.isFinite) || sd <= 0) return null;
+    const integer = Number.isInteger(threshold);
+    const lower = integer ? threshold - 0.5 : Math.floor(threshold) + 0.5;
+    const upper = integer ? threshold + 0.5 : lower;
+    const below = Phi((lower - mean) / sd), above = 1 - Phi((upper - mean) / sd);
+    return {above, below, equal: Math.max(0, 1 - below - above)};
+  }
+  function scenarioPrediction(out, minutes, options = state) {
+    return predict(state.home, state.away, {neutral: options.neutral, b2bH: options.b2bH,
+      b2bA: options.b2bA, adjH: options.adjH, adjA: options.adjA, minutes,
+      outFn: p => Object.hasOwn(out, p.eid) ? out[p.eid] : defaultOut(p)});
+  }
+  function renderScenarios() {
+    const base = scenarioPrediction({}, {});
+    const entries = [
+      {name: '원본 부상정보 · 자동 시간', prediction: base},
+      {name: '현재 조정', prediction: scenarioPrediction(overrides, minuteOverrides)},
+      ...scenarios.map(x => ({name: x.name, prediction: scenarioPrediction(x.out, x.minutes, x.options)}))
+    ];
+    const hc = num('hcLine'), ou = num('ouLine');
+    $('#scenarioRows').innerHTML = entries.map((x, i) => {
+      const p = x.prediction;
+      const action = i > 1 ? `<button class="ghost small" data-remove="${i-2}">삭제</button>` : '';
+      if (!p.valid || state.home === state.away) return `<tr><td>${esc(x.name)} ${action}</td><td colspan="7">240분 배분 / 팀 선택 확인 필요</td></tr>`;
+      const hp = hc === null ? null : marketProb(p.margin, S.sdMargin, -hc);
+      const op = ou === null ? null : marketProb(p.total, S.sdTotal, ou);
+      const probability = v => v ? `${pct(v.above)}% / ${pct(v.below)}% / ${pct(v.equal)}%` : '기준점 입력';
+      return `<tr><td>${esc(x.name)} ${action}</td><td>${p.pa.toFixed(1)} : ${p.ph.toFixed(1)}</td>
+        <td>${signed(p.margin)}<br><small>변화 ${base.valid ? signed(p.margin-base.margin) : '–'}</small></td>
+        <td>${p.total.toFixed(1)}<br><small>변화 ${base.valid ? signed(p.total-base.total) : '–'}</small></td>
+        <td>${hc === null ? '–' : signed(p.margin+hc)}</td><td>${ou === null ? '–' : signed(p.total-ou)}</td>
+        <td>${probability(hp)}</td><td>${probability(op)}</td></tr>`;
+    }).join('');
+    $('#scenarioNote').textContent = '현재 입력한 기준점과 모델 설정으로 비교합니다. 저장한 시나리오는 결장·출전시간·홈/백투백·직접 보정을 보존합니다. 확률 순서: 홈 핸디 승/패/동점, 오버/언더/동점. 과거 성능으로 보정하지 않은 모델 추정입니다.';
+  }
+  $('#saveScenario').addEventListener('click', () => {
+    if (!lastPred || !lastPred.valid || state.home === state.away) return;
+    if (scenarios.length >= 3) { $('#scenarioNote').textContent = '최대 3개입니다. 기존 시나리오를 삭제한 뒤 저장하세요.'; return; }
+    const name = $('#scenarioName').value.trim() || `시나리오 ${scenarios.length + 1}`;
+    scenarios.push({name, out: {...overrides}, minutes: {...minuteOverrides}, options: {...state}});
+    saveMatchup(); renderScenarios();
+  });
+  $('#scenarioRows').addEventListener('click', e => {
+    const button = e.target.closest('[data-remove]'); if (!button) return;
+    scenarios.splice(Number(button.dataset.remove), 1); saveMatchup(); renderScenarios();
+  });
+  $('#settlement').addEventListener('change', () => renderCalc(lastPred));
+  function renderQuality() {
+    const missing = D.players.filter(p => !p.cur && !p.prev);
+    const noCurrent = D.players.filter(p => !p.cur).length;
+    const seen = new Set(), duplicates = [];
+    D.players.forEach(p => { if (p.bref && seen.has(p.bref)) duplicates.push(p.name); seen.add(p.bref); });
+    const timezoneKnown = /(?:Z|[+-]\d{2}:\d{2})$/.test(D.updated);
+    const age = timezoneKnown ? (Date.now() - Date.parse(D.updated))/3600000 : null;
+    $('#dataQuality').innerHTML = `<h3>데이터 상태</h3><p>자료 시각: ${esc(D.updated)} ${timezoneKnown ? '(시간대 포함)' : '— 시간대 미기록: 최신 여부 확인 필요'}${age !== null && age > 6 ? ' · 6시간 이상 지난 자료' : ''}</p>
+      <p>${Object.keys(D.teams).length}개 팀 · ${D.players.length}명 · 이번 시즌 기록 없음 ${noCurrent}명 · 두 시즌 모두 없음 ${missing.length}명 · 중복 통계 ID ${duplicates.length}건</p>
+      <details><summary>통계 없는 선수 / 확인 사항</summary><p>${missing.map(p => esc(p.name)+' ('+esc(p.team)+')').join(', ')}</p>
+      <p>미출전·신인·수집 실패를 아직 자동 구분하지 않습니다. 부상 보고 시각은 선수 상태에 마우스를 올리면 확인할 수 있습니다. 자료 시각과 부상 보고 시각은 서로 다릅니다.</p></details>
+      <p class="muted">확률은 고정 변동폭을 사용한 추정입니다. 총점·점수차 변화와 데이터 상태를 함께 확인하세요.</p>`;
+  }
+
   // ---------- 로스터 / 부상자 선택 ----------
   function statusChip(p) {
     const inj = p.injury;
     const man = p.eid in overrides && overrides[p.eid] !== defaultOut(p);
     let h = '';
     if (inj) {
-      const tip = [inj.type, inj.returnDate ? '복귀 예상 ' + inj.returnDate : '', inj.comment].filter(Boolean).join(' · ');
+      const tip = [inj.date ? '부상 보고 ' + inj.date : '보고 시각 없음', inj.type, inj.returnDate ? '복귀 예상 ' + inj.returnDate : '', inj.comment].filter(Boolean).join(' · ');
       h += `<span class="chip ${inj.status === 'Out' ? 'out' : 'dtd'}" title="${esc(tip)}">${inj.status === 'Out' ? '결장' : '불투명'}${inj.type ? ' · ' + esc(inj.type) : ''}</span>`;
     }
     if (man) h += ` <span class="chip man">직접 ${overrides[p.eid] ? '제외' : '포함'}</span>`;
@@ -471,15 +566,15 @@
       body += `<tr class="${out ? 'out' : ''}">
         <td class="t keep"><input type="checkbox" data-eid="${esc(p.eid)}" ${out ? 'checked' : ''} title="결장 처리"></td>
         <td class="t sticky">${esc(p.name)} <small>${esc(p.pos)}</small></td>
-        <td class="t keep">${statusChip(p)}</td>
-        <td>${minCell}</td>
+        <td class="t keep">${statusChip(p)}${!p.cur && !p.prev ? '<span class=chip>통계 없음 · 추정</span>' : !p.cur ? '<span class=chip>지난 시즌만</span>' : ''}</td>
+        <td>${minCell}<br><input class=minutes type=number min=0 max=40 step=0.5 data-minutes="${esc(p.eid)}" aria-label="${esc(p.name)} 예상 출전시간" placeholder="자동" value="${minuteOverrides[p.eid] ?? ''}" ${out ? 'disabled' : ''}></td>
         <td>${fmt(s.pts)}</td><td>${fmt(s.trb)}</td><td>${fmt(s.ast)}</td><td>${fmt(s.stl)}</td><td>${fmt(s.blk)}</td>
         <td>${pct(s.fg_pct)}</td><td>${pct(s.fg3_pct)}</td><td>${fmt(s.bpm)}</td>
         <td class="keep">${impact}</td></tr>`;
     });
     el.innerHTML = `
       <h3><span>${side === 'home' ? '홈' : '원정'} · ${esc(tName(team))}</span><small>체크 = 결장 처리 · 수치는 이번+지난 시즌 혼합</small></h3>
-      <div class="lost">${outs.length ? `결장 <b>${outs.length}명</b>: ${outs.map(p => esc(p.name)).join(', ')}<br>
+      <p class="rotation-total">출전 합계 ${cur.totalMinutes.toFixed(1)} / 240분 ${cur.valid ? "✓" : "— 시간 조정 필요"} · 입력한 분은 고정, 빈칸은 자동 배분 (최대 40분). 통계 없는 선수도 직접 시간을 지정할 수 있습니다.</p><div class="lost">${outs.length ? `결장 <b>${outs.length}명</b>: ${outs.map(p => esc(p.name)).join(', ')}<br>
         빠지는 기록 합계 <b>${lostPts.toFixed(1)}점 · ${lostReb.toFixed(1)}리바 · ${lostAst.toFixed(1)}어시</b> (출전 ${lostMin.toFixed(0)}분)
         → 다른 선수가 메운 뒤 예상 영향: 팀 득점 <b class="${teamPtsEffect < 0 ? 'diff-neg' : ''}">${signed(teamPtsEffect)}</b>, 상대 득점 <b class="${oppPtsEffect > 0 ? 'diff-neg' : ''}">${signed(oppPtsEffect)}</b>` : '결장자 없음 (체크박스로 지정하세요)'}</div>
       <div class="table-wrap"><table class="grid">
@@ -489,10 +584,17 @@
         <tbody>${body}</tbody></table></div>`;
   }
   ['#rosterHome', '#rosterAway'].forEach(sel => $(sel).addEventListener('change', e => {
+    const input = e.target.closest('[data-minutes]');
+    if (input) {
+      if (input.value === '') delete minuteOverrides[input.dataset.minutes];
+      else if (input.checkValidity()) minuteOverrides[input.dataset.minutes] = Number(input.value);
+      else { input.reportValidity(); return; }
+      saveMatchup(); renderPredict(); return;
+    }
     const cb = e.target.closest('input[type=checkbox][data-eid]'); if (!cb) return;
     const p = D.players.find(x => x.eid === cb.dataset.eid);
     if (cb.checked === defaultOut(p)) delete overrides[p.eid]; else overrides[p.eid] = cb.checked;
-    save('overrides', overrides);
+    saveMatchup();
     renderGames(); renderPredict();
   }));
 
@@ -687,7 +789,7 @@
     const el = e.target.closest('[data-s]'); if (!el) return;
     const k = el.dataset.s;
     if (el.type === 'checkbox') S[k] = el.checked;
-    else { const v = parseFloat(el.value); if (!isNaN(v)) S[k] = v; }
+    else { const v = Number(el.value); const valid = Number.isFinite(v) && (['sdMargin','sdTotal','teamK'].includes(k) ? v > 0 : v >= 0) && (k !== 'rosterW' || v <= 1); if (!valid) { renderSettings(); return; } S[k] = v; }
     save('settings', S); recenter(); renderAll();
   });
   $('#resetSettings').addEventListener('click', () => { S = Object.assign({}, DEFAULTS); save('settings', S); renderSettings(); recenter(); renderAll(); });
@@ -712,13 +814,13 @@
     <ul>
       <li>예상 득점 = (리그 평균 효율 + 우리 공격 − 상대 수비) × 예상 페이스 ÷ 100, 여기에 홈 어드밴티지(${S.hca}점)와 백투백(${S.b2b}점), 직접 보정을 더합니다.</li>
       <li>승리 확률은 실제 점수차가 예상에서 표준편차 ${S.sdMargin}점 정도로 흔들린다고 보고 계산합니다 (정규분포). 언더오버는 총점 표준편차 ${S.sdTotal}점을 씁니다.</li>
-      <li><b>기대값</b> = 모델 확률 × 배당 − 1. +5%면 1만 원당 평균 500원 이득이라는 뜻이지만, 모델이 틀릴 수 있다는 점을 꼭 감안하세요.</li>
+      <li><b>기대값</b> = 모델 확률 × 배당 − 1. +5%면 1만 원당 평균 500원 이득이라는 뜻이지만, 정수 기준점은 동점 확률과 선택한 정산 규칙을 추가로 반영합니다. 모델 확률은 과거 경기로 검증되지 않았습니다.</li>
     </ul>
     <h3>4. 한계</h3>
     <ul>
       <li>시즌 초반에는 이번 시즌 표본이 적어서 지난 시즌 기록 비중이 큽니다.</li>
-      <li>코칭, 동기 부여, 경기 당일 컨디션, 출전 시간 제한(minutes restriction)은 모릅니다. 필요하면 '보정' 칸에 점수로 넣으세요.</li>
-      <li>이름 표기가 달라 통계가 연결되지 않은 선수(주로 신인)는 출전 시간 0으로 계산됩니다.</li>
+      <li>코칭, 동기 부여, 경기 당일 컨디션, 출전 제한은 로스터의 예상 출전시간으로 지정하세요. 포지션별 대체와 라인업 효과는 자동으로 판단하지 못합니다.</li>
+      <li>이름 표기가 달라 통계가 연결되지 않은 선수(주로 신인)는 자동 출전시간은 0입니다. 직접 시간을 입력하면 평균 이하 사전 평가값으로 계산됩니다.</li>
       <li>해외 시장 라인과 큰 차이가 나면 모델이 모르는 정보(부상 소식 등)가 있을 가능성도 생각하세요.</li>
     </ul>
     <h3>데이터 업데이트</h3>
@@ -731,6 +833,7 @@
     if (state.tab === 'teams') renderTeams();
   }
   recenter();
+  renderQuality();
   renderSettings();
   const now = Date.now();
   const firstGame = games.find(g => g.state !== 'post' && new Date(g.date).getTime() > now - 4 * 3600 * 1000) || games[games.length - 1];

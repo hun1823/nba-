@@ -195,3 +195,9 @@ a.tlink:hover { text-decoration: underline; }
   .pick-row label { width: 100%; }
   .result .team-score .pts { font-size: 30px; }
 }
+
+.minutes { width: 5.5em; margin-top: 4px; }
+.rotation-total, .quality-warning { padding: 10px; background: var(--warn-soft); color: var(--warn); }
+.scenarios .table-wrap { margin-top: 12px; }
+.scenarios td { white-space: nowrap; }
+#dataQuality p { margin: 8px 0; }

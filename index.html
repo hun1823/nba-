@@ -45,21 +45,18 @@
             <label class="chk"><input type="checkbox" id="b2bHome"> 홈팀 백투백</label>
             <label class="num">원정 보정 <input type="number" id="adjAway" step="0.5" value="0"></label>
             <label class="num">홈 보정 <input type="number" id="adjHome" step="0.5" value="0"></label>
-            <button id="resetInj" class="ghost small">부상 설정 초기화</button>
+            <button id="resetInj" class="ghost small">결장·출전시간 초기화</button>
           </div>
         </div>
 
+        <div id="dataQuality" class="card"></div>
         <div id="result" class="card result"></div>
 
         <div class="card calc">
-          <h3>토토 배당 계산기 <small>배당은 소수 배당(예: 1.85)으로 입력하세요. 비워두면 확률만 표시돼요.</small></h3>
+          <h3>핸디캡 · 언더오버 분석 <small>배당은 소수 배당(예: 1.85)으로 입력하세요. 비워두면 확률만 표시돼요.</small></h3>
+          <p class="muted">홈 -3.5는 홈팀이 4점 이상 이겨야 핸디 승입니다. 입력 기준점은 아래 모든 시나리오에 공통 적용됩니다. 정규시간 240분 기반 모델이며 연장 득점은 따로 예측하지 않습니다. 상품의 연장 포함 여부를 확인하세요.</p>
+          <label>정수 기준점 동점 처리 <select id="settlement"><option value="unknown">규칙 미확인 (기대값 보류)</option><option value="refund">원금 환급</option><option value="loss">양 선택 모두 미적중</option></select></label>
           <div class="calc-grid">
-            <div class="calc-box">
-              <h4>승패</h4>
-              <div class="inrow"><label>원정 승 배당 <input type="number" step="0.01" id="oddAway"></label>
-                <label>홈 승 배당 <input type="number" step="0.01" id="oddHome"></label></div>
-              <div id="outML"></div>
-            </div>
             <div class="calc-box">
               <h4>핸디캡 <small>(홈팀 기준, 예: -3.5)</small></h4>
               <div class="inrow"><label>홈 핸디 <input type="number" step="0.5" id="hcLine"></label>
@@ -74,10 +71,24 @@
                 <label>언더 배당 <input type="number" step="0.01" id="oddUnder"></label></div>
               <div id="outOU"></div>
             </div>
+            <div class="calc-box">
+              <h4>승패</h4>
+              <div class="inrow"><label>원정 승 배당 <input type="number" step="0.01" id="oddAway"></label>
+                <label>홈 승 배당 <input type="number" step="0.01" id="oddHome"></label></div>
+              <div id="outML"></div>
+            </div>
           </div>
           <div id="lineTables" class="line-tables"></div>
         </div>
 
+        <div class="card scenarios">
+          <h3>출전 시나리오 비교</h3>
+          <p>아래 로스터에서 결장 또는 제한 출전시간을 지정한 뒤 이름을 붙여 저장하세요. 같은 경기에서 최대 3개를 비교하며, 경기·데이터 시점별로 따로 보관합니다.</p>
+          <label>시나리오 이름 <input id="scenarioName" maxlength="60" placeholder="예: 주전 20분 제한"></label>
+          <button id="saveScenario">현재 설정 저장</button>
+          <div class="table-wrap"><table class="grid"><thead><tr><th>시나리오</th><th>원정 : 홈</th><th>홈 점수차</th><th>총점</th><th>핸디 기준 대비</th><th>O/U 기준 대비</th><th>핸디 승/패/동점</th><th>오버/언더/동점</th></tr></thead><tbody id="scenarioRows"></tbody></table></div>
+          <p id="scenarioNote" class="muted"></p>
+        </div>
         <div class="rosters">
           <div class="card roster" id="rosterAway"></div>
           <div class="card roster" id="rosterHome"></div>

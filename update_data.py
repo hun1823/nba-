@@ -211,6 +211,17 @@ def espn_id_from_links(athlete):
     return athlete.get("id")
 
 
+def find_bref(name, team, by_name, cur):
+    # Only exact normalized names or reviewed aliases may link identities.
+    aliases = {"ronald holland": "ron holland"}
+    n = norm_name(name)
+    ids = by_name.get(aliases.get(n, n), set())
+    if len(ids) == 1:
+        return next(iter(ids))
+    candidates = [pid for pid in ids if cur.get(pid, {}).get("team") == team]
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def main():
     today = dt.date.today()
     cur_year = today.year + 1 if today.month >= 8 else today.year  # 2026-27 시즌 = 2027
@@ -268,23 +279,6 @@ def main():
         for pid, p in src.items():
             by_name.setdefault(norm_name(p["name"]), set()).add(pid)
 
-    def find_bref(name, team):
-        n = norm_name(name)
-        ids = by_name.get(n)
-        if not ids:  # 이름 표기 차이: 성 + 이름 첫 글자로 재시도
-            parts = n.split()
-            if len(parts) >= 2:
-                cands = [pid for key, s in by_name.items() for pid in s
-                         if key.split()[-1] == parts[-1] and key[0] == parts[0][0]]
-                ids = set(cands) if cands else None
-        if not ids:
-            return None
-        if len(ids) == 1:
-            return next(iter(ids))
-        for pid in ids:  # 동명이인: 같은 팀 우선
-            if cur.get(pid, {}).get("team") == team or prev.get(pid, {}).get("team") == team:
-                return pid
-        return sorted(ids)[0]
 
     STAT_KEYS = list(PER_GAME_FIELDS) + list(ADV_FIELDS)
     players_out, unmatched = [], []
@@ -292,7 +286,7 @@ def main():
         for a in athletes:
             eid = str(a.get("id"))
             name = a.get("displayName") or a.get("fullName")
-            pid = find_bref(name, team)
+            pid = find_bref(name, team, by_name, cur)
             c, p = cur.get(pid) if pid else None, prev.get(pid) if pid else None
             if not pid:
                 unmatched.append("%s(%s)" % (name, team))
@@ -365,7 +359,7 @@ def main():
         team_stats[y] = {"label": s["label"], "teams": s["teams"], "league": s["league"]}
 
     payload = {
-        "updated": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "updated": dt.datetime.now(dt.timezone.utc).isoformat(),
         "curSeason": str(cur_year), "prevSeason": str(prev_year),
         "seasonLabels": {str(cur_year): label(cur_year), str(prev_year): label(prev_year)},
         "teams": teams_out, "teamStats": team_stats, "players": players_out, "games": games_u,
