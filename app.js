@@ -1,0 +1,740 @@
+'use strict';
+(function () {
+  const D = window.NBA_DATA;
+  const app = document.getElementById('app');
+  if (!D) {
+    app.innerHTML = '<div class="card empty">데이터가 없습니다. 터미널에서 <code>python3 update_data.py</code> 를 먼저 실행하세요.</div>';
+    return;
+  }
+
+  // ---------- 기본 도구 ----------
+  const $ = (s, el = document) => el.querySelector(s);
+  const $$ = (s, el = document) => Array.from(el.querySelectorAll(s));
+  const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const fmt = (v, d = 1) => (v == null || isNaN(v)) ? '–' : Number(v).toFixed(d);
+  const pct = v => (v == null || isNaN(v)) ? '–' : (v * 100).toFixed(1);
+  const signed = (v, d = 1) => (v == null || isNaN(v)) ? '–' : (v > 0 ? '+' : '') + v.toFixed(d);
+  const load = (k, def) => { try { const v = JSON.parse(localStorage.getItem('nbatoto_' + k)); return v == null ? def : v; } catch (e) { return def; } };
+  const save = (k, v) => { try { localStorage.setItem('nbatoto_' + k, JSON.stringify(v)); } catch (e) { /* 저장 불가 환경 */ } };
+
+  function erf(x) { // Abramowitz-Stegun 근사
+    const s = Math.sign(x); x = Math.abs(x);
+    const t = 1 / (1 + 0.3275911 * x);
+    const y = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x);
+    return s * y;
+  }
+  const Phi = z => 0.5 * (1 + erf(z / Math.SQRT2));
+
+  const KO = {
+    ATL: '애틀랜타 호크스', BOS: '보스턴 셀틱스', BRK: '브루클린 네츠', CHO: '샬럿 호네츠', CHI: '시카고 불스',
+    CLE: '클리블랜드 캐벌리어스', DAL: '댈러스 매버릭스', DEN: '덴버 너기츠', DET: '디트로이트 피스톤스',
+    GSW: '골든스테이트 워리어스', HOU: '휴스턴 로키츠', IND: '인디애나 페이서스', LAC: 'LA 클리퍼스', LAL: 'LA 레이커스',
+    MEM: '멤피스 그리즐리스', MIA: '마이애미 히트', MIL: '밀워키 벅스', MIN: '미네소타 팀버울브스',
+    NOP: '뉴올리언스 펠리컨스', NYK: '뉴욕 닉스', OKC: '오클라호마시티 썬더', ORL: '올랜도 매직',
+    PHI: '필라델피아 76ers', PHO: '피닉스 선즈', POR: '포틀랜드 트레일블레이저스', SAC: '새크라멘토 킹스',
+    SAS: '샌안토니오 스퍼스', TOR: '토론토 랩터스', UTA: '유타 재즈', WAS: '워싱턴 위저즈'
+  };
+  const tName = ab => KO[ab] || (D.teams[ab] || {}).name || ab;
+  const TEAMS = Object.keys(D.teams).sort((a, b) => tName(a).localeCompare(tName(b), 'ko'));
+
+  const CUR = D.curSeason, PREV = D.prevSeason;
+  const TS = D.teamStats || {};
+  const LBL = D.seasonLabels || {};
+  const teamRow = (season, ab) => ((TS[season] || {}).teams || {})[ab];
+  const league = season => (TS[season] || {}).league || {};
+  const teamG = (season, ab) => { const t = teamRow(season, ab); return t ? (t.wins || 0) + (t.losses || 0) : 0; };
+
+  const byTeam = {};
+  D.players.forEach(p => { (byTeam[p.team] = byTeam[p.team] || []).push(p); });
+
+  // ---------- 설정 ----------
+  const DEFAULTS = { hca: 2.4, sdMargin: 12.5, sdTotal: 18, prevGames: 25, teamK: 20, rosterW: 0.65, b2b: 1.5, dtdOut: false };
+  const SETTINGS_META = [
+    ['hca', '홈 어드밴티지 (점)', 0.1, '홈팀이 얻는 점수차 이점. 최근 NBA는 약 2~2.5점.'],
+    ['b2b', '백투백 페널티 (점)', 0.1, '전날 경기를 치른 팀이 잃는 점수차.'],
+    ['sdMargin', '점수차 표준편차', 0.5, '경기 결과가 예측에서 흔들리는 정도. NBA는 약 12~13점.'],
+    ['sdTotal', '총점 표준편차', 0.5, '총점이 예측에서 흔들리는 정도. NBA는 약 17~19점.'],
+    ['prevGames', '지난 시즌 가중치 (경기 수 환산)', 1, '지난 시즌 기록을 이번 시즌 몇 경기만큼 믿을지. 시즌 초반엔 크게.'],
+    ['teamK', '팀 실제 성적 신뢰 기준 (경기)', 1, '이 경기 수만큼 치르면 이번 시즌 팀 실제 성적을 50% 반영.'],
+    ['rosterW', '로스터 기반 비중 (0~1)', 0.05, '시즌 전 기준값에서 "현재 로스터 선수 능력" 대 "지난 시즌 팀 성적" 비율.'],
+  ];
+  let S = Object.assign({}, DEFAULTS, load('settings', {}));
+  let overrides = load('overrides', {}); // eid -> true(결장) / false(출전)
+
+  const defaultOut = p => !!(p.injury && (p.injury.status === 'Out' || (S.dtdOut && p.injury.status === 'Day-To-Day')));
+  const isOut = p => (p.eid in overrides) ? overrides[p.eid] : defaultOut(p);
+
+  // ---------- 선수 통계 (시즌/혼합) ----------
+  const PG_KEYS = ['mpg', 'fg', 'fga', 'fg3', 'fg3a', 'ft', 'fta', 'orb', 'drb', 'trb', 'ast', 'stl', 'blk', 'tov', 'pf', 'pts'];
+  const MIN_KEYS = ['usg_pct', 'per', 'obpm', 'dbpm', 'bpm'];
+  const wavg = (a, wa, b, wb) => {
+    if (a == null) return b; if (b == null) return a;
+    return (wa + wb) > 0 ? (a * wa + b * wb) / (wa + wb) : a;
+  };
+  const prevWeight = q => q ? S.prevGames * Math.min(1, (q.g || 0) / 30) : 0;
+
+  function stats(p, mode) {
+    const c = p.cur, q = p.prev;
+    let o;
+    if (mode === 'cur') o = c ? Object.assign({}, c) : null;
+    else if (mode === 'prev') o = q ? Object.assign({}, q) : null;
+    else if (!c && !q) o = null;
+    else if (!c) o = Object.assign({}, q, { g: 0, gPrev: q.g });
+    else if (!q) o = Object.assign({}, c, { gPrev: 0 });
+    else {
+      const wc = c.g || 0, wp = prevWeight(q);
+      o = { g: c.g, gs: c.gs, gPrev: q.g };
+      PG_KEYS.forEach(k => { o[k] = wavg(c[k], wc, q[k], wp); });
+      const mc = (c.mpg || 0) * wc, mq = (q.mpg || 0) * wp;
+      MIN_KEYS.forEach(k => { o[k] = wavg(c[k], mc, q[k], mq); });
+      o.fg_pct = o.fga > 0 ? o.fg / o.fga : null;
+      o.fg3_pct = o.fg3a > 0.05 ? o.fg3 / o.fg3a : null;
+      o.ft_pct = o.fta > 0.05 ? o.ft / o.fta : null;
+      o.efg_pct = o.fga > 0 ? (o.fg + 0.5 * o.fg3) / o.fga : null;
+      o.ts_pct = (o.fga + 0.44 * o.fta) > 0 ? o.pts / (2 * (o.fga + 0.44 * o.fta)) : null;
+    }
+    return o;
+  }
+
+  // 모델용 BPM: 출전 시간이 적으면 평균 이하 선수(사전값) 쪽으로 당김
+  const PRIOR_MIN = 250, PRIOR_OBPM = -1.0, PRIOR_DBPM = -0.5, PREV_MIN_FACTOR = 0.6;
+  const bpmCache = new Map();
+  function modelBPM(p) {
+    if (bpmCache.has(p.eid)) return bpmCache.get(p.eid);
+    const mc = (p.cur && p.cur.mp) || 0, mq = ((p.prev && p.prev.mp) || 0) * PREV_MIN_FACTOR;
+    const ob = (((p.cur && p.cur.obpm) || 0) * mc + ((p.prev && p.prev.obpm) || 0) * mq + PRIOR_OBPM * PRIOR_MIN) / (mc + mq + PRIOR_MIN);
+    const db = (((p.cur && p.cur.dbpm) || 0) * mc + ((p.prev && p.prev.dbpm) || 0) * mq + PRIOR_DBPM * PRIOR_MIN) / (mc + mq + PRIOR_MIN);
+    const r = { ob, db };
+    bpmCache.set(p.eid, r);
+    return r;
+  }
+
+  // 예상 출전 시간: 이번 시즌 '팀 경기당' 출전 시간(결장 경기는 0)과 지난 시즌 평균을 섞음
+  function projMin(p) {
+    const tg = teamG(CUR, p.team);
+    const mc = tg > 0 ? ((p.cur && p.cur.mp) || 0) / tg : null;
+    const mq = p.prev ? p.prev.mpg : null;
+    const wc = tg > 0 ? tg : 0, wq = mq != null ? prevWeight(p.prev) : 0;
+    if (mc == null && mq == null) return 0;
+    return wavg(mc, wc, mq, wq) || 0;
+  }
+
+  // 로테이션 (팀 합계 240분)
+  // 1) 건강할 때: 출전 시간이 많은 선수부터 채우고, 240분을 넘는 부분은 로스터 끝자리 선수에서 잘라냄
+  //    (지난 시즌 다른 팀 기록까지 합치면 240분을 크게 넘기 때문에 주전 시간이 줄지 않게 함)
+  // 2) 결장자의 시간은 남은 선수에게 m×(40−현재 시간) 가중치로 나눔
+  //    → 이미 35분 뛰는 주전보다 로테이션·벤치 선수가 더 많이 받음
+  const MAX_MIN = 40;
+  function rotation(team, outFn) {
+    const list = (byTeam[team] || []).map(p => ({ p, m: Math.min(MAX_MIN, projMin(p)), final: 0 }));
+    const sorted = list.filter(x => x.m > 0).sort((a, b) => b.m - a.m);
+    const sumM = sorted.reduce((s, x) => s + x.m, 0);
+    if (sumM <= 240) {
+      const k = sumM > 0 ? 240 / sumM : 0;
+      sorted.forEach(x => { x.final = Math.min(MAX_MIN, x.m * k); });
+    } else {
+      let cum = 0;
+      sorted.forEach(x => { x.final = Math.max(0, Math.min(x.m, 240 - cum)); cum += x.final; });
+    }
+    list.forEach(x => { x.base = x.final; });
+    let freed = 0;
+    list.forEach(x => { if (outFn(x.p)) { freed += x.final; x.final = 0; x.out = true; } });
+    for (let it = 0; it < 12 && freed > 0.01; it++) {
+      const cand = list.filter(x => !x.out && x.m > 0 && x.final < MAX_MIN - 0.01);
+      const wsum = cand.reduce((s, x) => s + x.m * (MAX_MIN - x.final), 0);
+      if (!wsum) break;
+      let left = 0;
+      cand.forEach(x => {
+        const add = freed * x.m * (MAX_MIN - x.final) / wsum;
+        const room = MAX_MIN - x.final;
+        x.final += Math.min(add, room);
+        left += Math.max(0, add - room);
+      });
+      freed = left;
+    }
+    let off = 0, def = 0;
+    list.forEach(x => { const b = modelBPM(x.p); off += b.ob * x.final / 48; def += b.db * x.final / 48; });
+    return { list, off, def };
+  }
+
+  const healthyCache = {};
+  const noneOut = () => false;
+  const healthy = t => healthyCache[t] || (healthyCache[t] = rotation(t, noneOut));
+  let OFF_MEAN = 0, DEF_MEAN = 0;
+  function recenter() {
+    Object.keys(healthyCache).forEach(k => delete healthyCache[k]);
+    bpmCache.clear();
+    const ts = TEAMS.filter(t => byTeam[t]);
+    OFF_MEAN = ts.reduce((s, t) => s + healthy(t).off, 0) / ts.length;
+    DEF_MEAN = ts.reduce((s, t) => s + healthy(t).def, 0) / ts.length;
+  }
+
+  function leagueBase() {
+    const lc = league(CUR), lp = league(PREV);
+    const gs = TEAMS.map(t => teamG(CUR, t));
+    const gL = gs.reduce((a, b) => a + b, 0) / Math.max(1, gs.length);
+    const w = gL / (gL + S.teamK);
+    return {
+      ortg: wavg(lc.off_rtg, w, lp.off_rtg, 1 - w) || 114,
+      pace: wavg(lc.pace, w, lp.pace, 1 - w) || 99,
+    };
+  }
+
+  // 팀 모델: off/def = 리그 평균 대비 100포제션당 (+ 좋음)
+  function teamModel(team, outFn) {
+    const h = healthy(team), r = rotation(team, outFn);
+    const tc = teamRow(CUR, team), tp = teamRow(PREV, team);
+    const lc = league(CUR), lp = league(PREV);
+    const g = teamG(CUR, team), wa = g / (g + S.teamK);
+    const rOff = h.off - OFF_MEAN, rDef = h.def - DEF_MEAN;
+    const pOff = tp && lp.off_rtg ? tp.off_rtg - lp.off_rtg : rOff;
+    const pDef = tp && lp.off_rtg ? (lp.def_rtg || lp.off_rtg) - tp.def_rtg : rDef;
+    const priorOff = S.rosterW * rOff + (1 - S.rosterW) * pOff;
+    const priorDef = S.rosterW * rDef + (1 - S.rosterW) * pDef;
+    const cOff = tc && g ? tc.off_rtg - lc.off_rtg : priorOff;
+    const cDef = tc && g ? (lc.def_rtg || lc.off_rtg) - tc.def_rtg : priorDef;
+    const baseOff = wa * cOff + (1 - wa) * priorOff, baseDef = wa * cDef + (1 - wa) * priorDef;
+    const dOff = r.off - h.off, dDef = r.def - h.def;
+    const pace = wavg(tc && g ? tc.pace : null, wa, tp ? tp.pace : null, 1 - wa) || leagueBase().pace;
+    return { team, off: baseOff + dOff, def: baseDef + dDef, baseOff, baseDef, dOff, dDef, pace, rot: r, healthy: h, wa, g };
+  }
+
+  function predict(home, away, o) {
+    o = o || {};
+    const outFn = o.outFn || isOut;
+    const H = teamModel(home, outFn), A = teamModel(away, outFn);
+    const L = leagueBase();
+    const pace = H.pace * A.pace / L.pace;
+    const rawH = (L.ortg + H.off - A.def) * pace / 100;
+    const rawA = (L.ortg + A.off - H.def) * pace / 100;
+    let ph = rawH, pa = rawA;
+    const hca = o.neutral ? 0 : S.hca;
+    ph += hca / 2; pa -= hca / 2;
+    if (o.b2bH) { ph -= S.b2b * 2 / 3; pa += S.b2b / 3; }
+    if (o.b2bA) { pa -= S.b2b * 2 / 3; ph += S.b2b / 3; }
+    ph += o.adjH || 0; pa += o.adjA || 0;
+    const margin = ph - pa, total = ph + pa;
+    return { H, A, L, pace, ph, pa, margin, total, pHome: Phi(margin / S.sdMargin), hca };
+  }
+
+  // ---------- 경기 일정 ----------
+  const games = (D.games || []).slice().sort((a, b) => a.date.localeCompare(b.date));
+  const kst = (iso, opt) => new Date(iso).toLocaleString('ko-KR', Object.assign({ timeZone: 'Asia/Seoul' }, opt));
+  function isB2B(team, iso) {
+    const t = new Date(iso).getTime();
+    return games.some(g => (g.home.team === team || g.away.team === team) && g.date !== iso &&
+      t - new Date(g.date).getTime() > 0 && t - new Date(g.date).getTime() < 32 * 3600 * 1000);
+  }
+
+  // ---------- 상태 ----------
+  const state = {
+    tab: load('tab', 'predict'), gameId: null,
+    home: null, away: null, neutral: false, b2bH: false, b2bA: false, adjH: 0, adjA: 0,
+    pMode: 'blend', pTeam: '', pSort: { k: 'pts', dir: -1 }, tSort: { k: 'model', dir: -1 },
+  };
+
+  // ---------- 탭 ----------
+  function showTab(t) {
+    state.tab = t; save('tab', t);
+    $$('#tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === t));
+    $$('.tab').forEach(s => s.classList.toggle('active', s.id === 'tab-' + t));
+    if (t === 'players') renderPlayers();
+    if (t === 'teams') renderTeams();
+  }
+  $('#tabs').addEventListener('click', e => { const b = e.target.closest('button'); if (b) showTab(b.dataset.tab); });
+
+  $('#updated').textContent = '데이터 업데이트: ' + D.updated + ' · ' + (LBL[CUR] || '') + ' 시즌';
+
+  // ---------- 경기 목록 ----------
+  function renderGames() {
+    const showFinal = $('#showFinal').checked;
+    const list = games.filter(g => showFinal || g.state !== 'post');
+    if (!list.length) { $('#gamesList').innerHTML = '<div class="muted" style="padding:10px">표시할 경기가 없어요. 위에서 팀을 직접 고르세요.</div>'; return; }
+    let html = '', lastDay = '';
+    list.forEach(g => {
+      const day = kst(g.date, { month: 'long', day: 'numeric', weekday: 'short' });
+      if (day !== lastDay) { html += `<div class="day-label">${esc(day)}</div>`; lastDay = day; }
+      const pr = predict(g.home.team, g.away.team, { b2bH: isB2B(g.home.team, g.date), b2bA: isB2B(g.away.team, g.date) });
+      const fav = pr.margin >= 0 ? g.home.team : g.away.team;
+      const favP = pr.margin >= 0 ? pr.pHome : 1 - pr.pHome;
+      const time = kst(g.date, { hour: '2-digit', minute: '2-digit', hour12: false });
+      let line = '';
+      if (g.line && (g.line.homeSpread != null || g.line.total != null)) {
+        line = `시장: ${g.line.homeSpread != null ? g.home.team + ' ' + signed(g.line.homeSpread) : ''} ${g.line.total != null ? '· O/U ' + g.line.total : ''}`;
+      }
+      const score = g.state !== 'pre' && g.home.score != null ? `${g.away.score} : ${g.home.score}` : '';
+      html += `<button class="game ${g.state === 'post' ? 'final' : ''} ${state.gameId === g.id ? 'sel' : ''}" data-id="${esc(g.id)}">
+        <div class="g-top"><span>${esc(time)} ${g.state === 'in' ? '· 진행 중' : g.state === 'post' ? '· 종료' : ''}</span><span>${esc(score)}</span></div>
+        <div class="g-teams">${esc(g.away.team)} @ ${esc(g.home.team)} <small>${esc(tName(g.away.team).split(' ').pop())} vs ${esc(tName(g.home.team).split(' ').pop())}</small></div>
+        <div class="g-model">모델: <b>${esc(fav)} ${(favP * 100).toFixed(0)}%</b> · 총점 ${pr.total.toFixed(1)} · ${esc(g.home.team)} ${signed(-pr.margin)}</div>
+        ${line ? `<div class="g-line">${esc(line)}</div>` : ''}
+      </button>`;
+    });
+    $('#gamesList').innerHTML = html;
+  }
+  $('#showFinal').addEventListener('change', renderGames);
+  $('#gamesList').addEventListener('click', e => {
+    const b = e.target.closest('.game'); if (!b) return;
+    selectGame(games.find(g => g.id === b.dataset.id));
+  });
+
+  function selectGame(g) {
+    if (!g) return;
+    state.gameId = g.id; state.home = g.home.team; state.away = g.away.team; state.neutral = false;
+    state.b2bH = isB2B(g.home.team, g.date); state.b2bA = isB2B(g.away.team, g.date);
+    state.adjH = 0; state.adjA = 0;
+    ['oddAway', 'oddHome', 'oddHcH', 'oddHcA', 'oddOver', 'oddUnder'].forEach(id => { $('#' + id).value = ''; });
+    $('#hcLine').value = g.line && g.line.homeSpread != null ? g.line.homeSpread : '';
+    $('#ouLine').value = g.line && g.line.total != null ? g.line.total : '';
+    syncPickers(); renderGames(); renderPredict();
+  }
+
+  // ---------- 매치업 선택 ----------
+  const opts = TEAMS.map(t => `<option value="${t}">${esc(tName(t))} (${t})</option>`).join('');
+  $('#homeSel').innerHTML = opts; $('#awaySel').innerHTML = opts;
+  function syncPickers() {
+    $('#homeSel').value = state.home; $('#awaySel').value = state.away;
+    $('#neutral').checked = state.neutral; $('#b2bHome').checked = state.b2bH; $('#b2bAway').checked = state.b2bA;
+    $('#adjHome').value = state.adjH; $('#adjAway').value = state.adjA;
+  }
+  function manualChange() {
+    state.home = $('#homeSel').value; state.away = $('#awaySel').value;
+    const g = games.find(x => x.id === state.gameId);
+    if (g && (g.home.team !== state.home || g.away.team !== state.away)) state.gameId = null;
+    state.neutral = $('#neutral').checked; state.b2bH = $('#b2bHome').checked; state.b2bA = $('#b2bAway').checked;
+    state.adjH = parseFloat($('#adjHome').value) || 0; state.adjA = parseFloat($('#adjAway').value) || 0;
+    renderGames(); renderPredict();
+  }
+  ['homeSel', 'awaySel', 'neutral', 'b2bHome', 'b2bAway', 'adjHome', 'adjAway'].forEach(id => $('#' + id).addEventListener('change', manualChange));
+  ['adjHome', 'adjAway'].forEach(id => $('#' + id).addEventListener('input', manualChange));
+  $('#swapBtn').addEventListener('click', () => {
+    [state.home, state.away] = [state.away, state.home]; [state.b2bH, state.b2bA] = [state.b2bA, state.b2bH];
+    [state.adjH, state.adjA] = [state.adjA, state.adjH];
+    const hc = parseFloat($('#hcLine').value); if (!isNaN(hc)) $('#hcLine').value = -hc;
+    state.gameId = null; syncPickers(); renderGames(); renderPredict();
+  });
+  $('#resetInj').addEventListener('click', () => { overrides = {}; save('overrides', overrides); renderAll(); });
+  ['oddAway', 'oddHome', 'hcLine', 'oddHcH', 'oddHcA', 'ouLine', 'oddOver', 'oddUnder'].forEach(id => $('#' + id).addEventListener('input', () => renderCalc(lastPred)));
+
+  // ---------- 예측 결과 ----------
+  let lastPred = null;
+  function renderPredict() {
+    if (!state.home || !state.away) return;
+    const pr = predict(state.home, state.away, { neutral: state.neutral, b2bH: state.b2bH, b2bA: state.b2bA, adjH: state.adjH, adjA: state.adjA });
+    lastPred = pr;
+    const g = games.find(x => x.id === state.gameId);
+    const pA = 1 - pr.pHome;
+    const hName = tName(state.home), aName = tName(state.away);
+    const favTeam = pr.margin >= 0 ? state.home : state.away;
+    let market = '';
+    if (g && g.line && (g.line.homeSpread != null || g.line.total != null)) {
+      const parts = [];
+      if (g.line.homeSpread != null) {
+        const modelLine = -pr.margin, d = modelLine - g.line.homeSpread;
+        parts.push(`핸디 ${esc(state.home)} ${signed(g.line.homeSpread)} (모델 ${signed(modelLine)}, <span class="${d < 0 ? 'diff-pos' : 'diff-neg'}">${d < 0 ? '홈 쪽' : '원정 쪽'} ${Math.abs(d).toFixed(1)}점 유리</span>)`);
+      }
+      if (g.line.total != null) {
+        const d = pr.total - g.line.total;
+        parts.push(`O/U ${g.line.total} (모델 ${pr.total.toFixed(1)}, <span class="${d > 0 ? 'diff-pos' : 'diff-neg'}">${d > 0 ? '오버' : '언더'} 쪽 ${Math.abs(d).toFixed(1)}점</span>)`);
+      }
+      if (g.line.homeML || g.line.awayML) parts.push(`머니라인 ${esc(state.away)} ${esc(g.line.awayML || '–')} / ${esc(state.home)} ${esc(g.line.homeML || '–')}`);
+      market = `<div class="market"><b>해외 시장 라인 (${esc(g.line.provider || '북메이커')})</b> · ${parts.join(' · ')}</div>`;
+    }
+    const row = (lb, a, h, d = 1) => `<tr><td>${lb}</td><td>${typeof a === 'string' ? a : signed(a, d)}</td><td>${typeof h === 'string' ? h : signed(h, d)}</td></tr>`;
+    const toPts = v => v * pr.pace / 100;
+    $('#result').innerHTML = `
+      <div class="score-row">
+        <div class="team-score away"><div class="nm">원정 · ${esc(aName)}</div><div class="ab">${esc(state.away)}</div><div class="pts">${pr.pa.toFixed(1)}</div></div>
+        <div class="vs">예상 스코어</div>
+        <div class="team-score home"><div class="nm">홈 · ${esc(hName)}${state.neutral ? ' (중립)' : ''}</div><div class="ab">${esc(state.home)}</div><div class="pts">${pr.ph.toFixed(1)}</div></div>
+      </div>
+      <div class="probbar">
+        <div class="a" style="width:${(pA * 100).toFixed(1)}%">${state.away} ${(pA * 100).toFixed(0)}%</div>
+        <div class="h" style="width:${(pr.pHome * 100).toFixed(1)}%">${state.home} ${(pr.pHome * 100).toFixed(0)}%</div>
+      </div>
+      <div class="kpis">
+        <div class="kpi"><div class="lb">예상 총점</div><div class="vl">${pr.total.toFixed(1)}</div><div class="sub">±${S.sdTotal} (표준편차)</div></div>
+        <div class="kpi"><div class="lb">예상 점수차</div><div class="vl">${esc(favTeam)} ${Math.abs(pr.margin).toFixed(1)}</div><div class="sub">홈 핸디 환산 ${signed(-pr.margin)}</div></div>
+        <div class="kpi"><div class="lb">승리 확률</div><div class="vl">${esc(favTeam)} ${(Math.max(pr.pHome, pA) * 100).toFixed(1)}%</div><div class="sub">공정 배당 ${(1 / Math.max(pr.pHome, pA)).toFixed(2)}</div></div>
+        <div class="kpi"><div class="lb">예상 페이스</div><div class="vl">${pr.pace.toFixed(1)}</div><div class="sub">48분당 포제션 (리그 ${pr.L.pace.toFixed(1)})</div></div>
+      </div>
+      ${market}
+      <details class="breakdown"><summary>계산 근거 보기</summary>
+        <table>
+          <tr><th>항목 (경기당 점수 환산)</th><th>${esc(state.away)}</th><th>${esc(state.home)}</th></tr>
+          ${row('기본 공격력 (리그 대비)', toPts(pr.A.baseOff), toPts(pr.H.baseOff))}
+          ${row('기본 수비력 (리그 대비, +가 좋음)', toPts(pr.A.baseDef), toPts(pr.H.baseDef))}
+          ${row('결장자로 인한 공격 변화', toPts(pr.A.dOff), toPts(pr.H.dOff))}
+          ${row('결장자로 인한 수비 변화', toPts(pr.A.dDef), toPts(pr.H.dDef))}
+          ${row('팀 페이스', pr.A.pace.toFixed(1), pr.H.pace.toFixed(1))}
+          ${row('이번 시즌 실제 성적 반영 비율', (pr.A.wa * 100).toFixed(0) + '% (' + pr.A.g + '경기)', (pr.H.wa * 100).toFixed(0) + '% (' + pr.H.g + '경기)')}
+          ${row('홈 어드밴티지', state.neutral ? '0' : (-pr.hca / 2).toFixed(1), state.neutral ? '0' : '+' + (pr.hca / 2).toFixed(1))}
+          ${row('백투백', state.b2bA ? '적용' : '–', state.b2bH ? '적용' : '–')}
+          ${row('직접 보정', state.adjA, state.adjH)}
+        </table>
+        <p>리그 평균 공격 효율 ${pr.L.ortg.toFixed(1)}점/100포제션 기준. 예상 득점 = (리그 평균 + 우리 공격 − 상대 수비) × 페이스 ÷ 100 + 홈/백투백/보정.</p>
+      </details>`;
+    renderCalc(pr);
+    renderRoster('away', state.away, pr.A, pr);
+    renderRoster('home', state.home, pr.H, pr);
+  }
+
+  // ---------- 배당 계산기 ----------
+  const num = id => { const v = parseFloat($('#' + id).value); return isNaN(v) ? null : v; };
+  function betRows(items) {
+    // items: [{pick, p, odds}]
+    const implied = items.every(x => x.odds) ? items.reduce((s, x) => s + 1 / x.odds, 0) : null;
+    let h = '<div class="bet"><span class="h">선택</span><span class="h">모델 확률</span><span class="h">공정 배당</span><span class="h">기대값</span>';
+    items.forEach(x => {
+      let ev = '<span class="muted">배당 입력</span>';
+      if (x.odds) {
+        const v = x.p * x.odds - 1;
+        const imp = implied ? (1 / x.odds) / implied : 1 / x.odds;
+        ev = `<span class="ev ${v > 0 ? 'pos' : 'neg'}" title="배당 기준 확률 ${(imp * 100).toFixed(1)}%">${v > 0 ? '+' : ''}${(v * 100).toFixed(1)}%</span>`;
+      }
+      h += `<span class="pick">${esc(x.pick)}</span><span>${(x.p * 100).toFixed(1)}%</span><span>${(1 / x.p).toFixed(2)}</span>${ev}`;
+    });
+    h += '</div>';
+    if (implied) h += `<div class="muted" style="margin-top:4px">환수율 ${(100 / implied).toFixed(1)}% · 기대값이 +면 모델 기준으로 배당이 후한 편</div>`;
+    return h;
+  }
+  function renderCalc(pr) {
+    if (!pr) return;
+    const pH = pr.pHome, pA = 1 - pH;
+    $('#outML').innerHTML = betRows([{ pick: state.away + ' 승', p: pA, odds: num('oddAway') }, { pick: state.home + ' 승', p: pH, odds: num('oddHome') }]);
+    const hc = num('hcLine');
+    if (hc != null) {
+      const pc = Phi((pr.margin + hc) / S.sdMargin);
+      $('#outHC').innerHTML = betRows([{ pick: `${state.home} ${signed(hc)} 핸디 승`, p: pc, odds: num('oddHcH') }, { pick: `${state.away} ${signed(-hc)} (핸디 패)`, p: 1 - pc, odds: num('oddHcA') }]);
+    } else $('#outHC').innerHTML = '<div class="muted">홈 핸디 기준점을 입력하세요.</div>';
+    const ou = num('ouLine');
+    if (ou != null) {
+      const po = 1 - Phi((ou - pr.total) / S.sdTotal);
+      $('#outOU').innerHTML = betRows([{ pick: `오버 ${ou}`, p: po, odds: num('oddOver') }, { pick: `언더 ${ou}`, p: 1 - po, odds: num('oddUnder') }]);
+    } else $('#outOU').innerHTML = '<div class="muted">기준점을 입력하세요.</div>';
+
+    // 기준점별 확률표
+    let hcRows = '';
+    for (let i = -6; i <= 6; i++) {
+      const L = Math.floor(-pr.margin) + 0.5 + i * 1.5;
+      const p = Phi((pr.margin + L) / S.sdMargin);
+      hcRows += `<tr class="${Math.abs(L + pr.margin) < 0.76 ? 'near' : ''}"><td>${esc(state.home)} ${signed(L)}</td><td>${(p * 100).toFixed(1)}%</td><td>${(1 / p).toFixed(2)}</td><td>${((1 - p) * 100).toFixed(1)}%</td><td>${(1 / (1 - p)).toFixed(2)}</td></tr>`;
+    }
+    let ouRows = '';
+    for (let i = -6; i <= 6; i++) {
+      const L = Math.floor(pr.total) + 0.5 + i * 2;
+      const p = 1 - Phi((L - pr.total) / S.sdTotal);
+      ouRows += `<tr class="${Math.abs(L - pr.total) < 1.01 ? 'near' : ''}"><td>${L.toFixed(1)}</td><td>${(p * 100).toFixed(1)}%</td><td>${(1 / p).toFixed(2)}</td><td>${((1 - p) * 100).toFixed(1)}%</td><td>${(1 / (1 - p)).toFixed(2)}</td></tr>`;
+    }
+    $('#lineTables').innerHTML = `
+      <div><h4>핸디캡 기준점별 확률 <small>(홈 기준)</small></h4><table class="mini"><tr><th>기준점</th><th>핸디 승</th><th>공정배당</th><th>핸디 패</th><th>공정배당</th></tr>${hcRows}</table></div>
+      <div><h4>언더오버 기준점별 확률</h4><table class="mini"><tr><th>기준점</th><th>오버</th><th>공정배당</th><th>언더</th><th>공정배당</th></tr>${ouRows}</table></div>`;
+  }
+
+  // ---------- 로스터 / 부상자 선택 ----------
+  function statusChip(p) {
+    const inj = p.injury;
+    const man = p.eid in overrides && overrides[p.eid] !== defaultOut(p);
+    let h = '';
+    if (inj) {
+      const tip = [inj.type, inj.returnDate ? '복귀 예상 ' + inj.returnDate : '', inj.comment].filter(Boolean).join(' · ');
+      h += `<span class="chip ${inj.status === 'Out' ? 'out' : 'dtd'}" title="${esc(tip)}">${inj.status === 'Out' ? '결장' : '불투명'}${inj.type ? ' · ' + esc(inj.type) : ''}</span>`;
+    }
+    if (man) h += ` <span class="chip man">직접 ${overrides[p.eid] ? '제외' : '포함'}</span>`;
+    return h;
+  }
+  function renderRoster(side, team, M, pr) {
+    const el = $(side === 'home' ? '#rosterHome' : '#rosterAway');
+    const h = M.healthy, cur = M.rot;
+    const finalBy = new Map(cur.list.map(x => [x.p.eid, x.final]));
+    const healthyBy = new Map(h.list.map(x => [x.p.eid, x.final]));
+    const ppace = pr.pace / 100;
+    const rows = (byTeam[team] || []).slice().sort((a, b) => (healthyBy.get(b.eid) || 0) - (healthyBy.get(a.eid) || 0) || ((b.prev || b.cur || {}).pts || 0) - ((a.prev || a.cur || {}).pts || 0));
+    // 결장자 손실 요약
+    const outs = rows.filter(isOut);
+    let lostPts = 0, lostReb = 0, lostAst = 0, lostMin = 0;
+    outs.forEach(p => { const s = stats(p, 'blend') || {}; lostPts += s.pts || 0; lostReb += s.trb || 0; lostAst += s.ast || 0; lostMin += healthyBy.get(p.eid) || 0; });
+    const teamPtsEffect = (M.dOff) * ppace, oppPtsEffect = -(M.dDef) * ppace;
+
+    let body = '';
+    rows.forEach(p => {
+      const s = stats(p, 'blend') || {};
+      const out = isOut(p);
+      const hm = healthyBy.get(p.eid) || 0, fm = finalBy.get(p.eid) || 0;
+      let impact = '';
+      if (hm > 2) {
+        const solo = rotation(team, x => x.eid === p.eid);
+        const d = ((solo.off - h.off) + (solo.def - h.def)) * ppace;
+        impact = `<span class="imp ${d < -0.05 ? 'diff-neg' : d > 0.05 ? 'diff-pos' : ''}">${signed(d)}</span>`;
+      }
+      const minCell = out ? `${hm.toFixed(0)} → 0` : (fm - hm > 0.5 ? `${hm.toFixed(0)} → <span class="mins-up">${fm.toFixed(0)}</span>` : fm.toFixed(0));
+      body += `<tr class="${out ? 'out' : ''}">
+        <td class="t keep"><input type="checkbox" data-eid="${esc(p.eid)}" ${out ? 'checked' : ''} title="결장 처리"></td>
+        <td class="t sticky">${esc(p.name)} <small>${esc(p.pos)}</small></td>
+        <td class="t keep">${statusChip(p)}</td>
+        <td>${minCell}</td>
+        <td>${fmt(s.pts)}</td><td>${fmt(s.trb)}</td><td>${fmt(s.ast)}</td><td>${fmt(s.stl)}</td><td>${fmt(s.blk)}</td>
+        <td>${pct(s.fg_pct)}</td><td>${pct(s.fg3_pct)}</td><td>${fmt(s.bpm)}</td>
+        <td class="keep">${impact}</td></tr>`;
+    });
+    el.innerHTML = `
+      <h3><span>${side === 'home' ? '홈' : '원정'} · ${esc(tName(team))}</span><small>체크 = 결장 처리 · 수치는 이번+지난 시즌 혼합</small></h3>
+      <div class="lost">${outs.length ? `결장 <b>${outs.length}명</b>: ${outs.map(p => esc(p.name)).join(', ')}<br>
+        빠지는 기록 합계 <b>${lostPts.toFixed(1)}점 · ${lostReb.toFixed(1)}리바 · ${lostAst.toFixed(1)}어시</b> (출전 ${lostMin.toFixed(0)}분)
+        → 다른 선수가 메운 뒤 예상 영향: 팀 득점 <b class="${teamPtsEffect < 0 ? 'diff-neg' : ''}">${signed(teamPtsEffect)}</b>, 상대 득점 <b class="${oppPtsEffect > 0 ? 'diff-neg' : ''}">${signed(oppPtsEffect)}</b>` : '결장자 없음 (체크박스로 지정하세요)'}</div>
+      <div class="table-wrap"><table class="grid">
+        <thead><tr><th class="t">결장</th><th class="t sticky">선수</th><th class="t">상태</th><th title="부상 반영 전 → 후 예상 출전 시간">출전(분)</th>
+        <th>득점</th><th>리바</th><th>어시</th><th>스틸</th><th>블록</th><th>야투%</th><th>3점%</th><th>BPM</th>
+        <th title="이 선수 혼자 빠질 때 팀 점수차 변화(경기당)">결장 영향</th></tr></thead>
+        <tbody>${body}</tbody></table></div>`;
+  }
+  ['#rosterHome', '#rosterAway'].forEach(sel => $(sel).addEventListener('change', e => {
+    const cb = e.target.closest('input[type=checkbox][data-eid]'); if (!cb) return;
+    const p = D.players.find(x => x.eid === cb.dataset.eid);
+    if (cb.checked === defaultOut(p)) delete overrides[p.eid]; else overrides[p.eid] = cb.checked;
+    save('overrides', overrides);
+    renderGames(); renderPredict();
+  }));
+
+  // ---------- 선수 통계 표 ----------
+  const COLS = [
+    { k: 'rk', t: '#', nosort: 1 },
+    { k: 'name', t: '선수', text: 1, sticky: 1 },
+    { k: 'team', t: '팀', text: 1 },
+    { k: 'pos', t: '포지션', text: 1 },
+    { k: 'status', t: '상태', text: 1 },
+    { k: 'g', t: '경기', d: 0 },
+    { k: 'gPrev', t: '지난시즌 경기', d: 0, only: 'blend' },
+    { k: 'mpg', t: '출전(분)', d: 1 },
+    { k: 'pts', t: '득점', d: 1, heat: 1 },
+    { k: 'trb', t: '리바운드', d: 1, heat: 1 },
+    { k: 'orb', t: '공격리바', d: 1 },
+    { k: 'drb', t: '수비리바', d: 1 },
+    { k: 'ast', t: '어시스트', d: 1, heat: 1 },
+    { k: 'stl', t: '스틸', d: 1, heat: 1 },
+    { k: 'blk', t: '블록', d: 1, heat: 1 },
+    { k: 'tov', t: '턴오버', d: 1, heat: -1 },
+    { k: 'fg', t: '야투성공', d: 1 },
+    { k: 'fga', t: '야투시도', d: 1 },
+    { k: 'fg_pct', t: '야투율', pct: 1, heat: 1, minAtt: ['fga', 4] },
+    { k: 'fg3', t: '3점성공', d: 1 },
+    { k: 'fg3a', t: '3점시도', d: 1 },
+    { k: 'fg3_pct', t: '3점슛%', pct: 1, heat: 1, minAtt: ['fg3a', 2] },
+    { k: 'ft', t: '자유투성공', d: 1 },
+    { k: 'fta', t: '자유투시도', d: 1 },
+    { k: 'ft_pct', t: '자유투%', pct: 1, heat: 1, minAtt: ['fta', 1.5] },
+    { k: 'efg_pct', t: 'eFG%', pct: 1 },
+    { k: 'ts_pct', t: 'TS%', pct: 1, heat: 1, minAtt: ['fga', 4] },
+    { k: 'usg_pct', t: 'USG%', d: 1 },
+    { k: 'per', t: 'PER', d: 1 },
+    { k: 'obpm', t: 'OBPM', d: 1 },
+    { k: 'dbpm', t: 'DBPM', d: 1 },
+    { k: 'bpm', t: 'BPM', d: 1, heat: 1 },
+    { k: 'pmin', t: '예상 출전', d: 1, title: '모델이 쓰는 다음 경기 예상 출전 시간(부상 반영 전)' },
+  ];
+  const modeSel = $('#pMode');
+  modeSel.innerHTML = `<option value="blend">혼합 (${esc(LBL[CUR])} + ${esc(LBL[PREV])}, 모델 기준)</option><option value="cur">${esc(LBL[CUR])} (이번 시즌)</option><option value="prev">${esc(LBL[PREV])} (지난 시즌)</option>`;
+  $('#pTeam').innerHTML += TEAMS.map(t => `<option value="${t}">${esc(tName(t))} (${t})</option>`).join('');
+  const statusText = p => isOut(p) ? '결장' : (p.injury ? '불투명' : '');
+
+  function playerRows() {
+    const mode = $('#pMode').value, team = $('#pTeam').value, q = $('#pSearch').value.trim().toLowerCase();
+    const minG = parseFloat($('#pMinG').value) || 0, injOnly = $('#pInjOnly').checked;
+    const rows = [];
+    D.players.forEach(p => {
+      if (team && p.team !== team) return;
+      if (q && !p.name.toLowerCase().includes(q)) return;
+      if (injOnly && !p.injury && !isOut(p)) return;
+      const s = stats(p, mode);
+      const g = s ? (mode === 'blend' ? (s.g || 0) + (s.gPrev || 0) : s.g || 0) : 0;
+      if (g < minG) return;
+      rows.push(Object.assign({}, s || {}, { _p: p, name: p.name, team: p.team, pos: p.pos, status: statusText(p), pmin: projMin(p) }));
+    });
+    const { k, dir } = state.pSort;
+    const col = COLS.find(c => c.k === k) || {};
+    rows.sort((a, b) => {
+      const va = a[k], vb = b[k];
+      if (col.text) return dir * String(va || '').localeCompare(String(vb || ''), 'ko');
+      if (va == null && vb == null) return 0; if (va == null) return 1; if (vb == null) return -1;
+      return dir * (va - vb);
+    });
+    return { rows, mode };
+  }
+
+  function heatStyle(c, v, row, range) {
+    if (!c.heat || v == null || !range || range.max === range.min) return '';
+    if (c.minAtt && !(row[c.minAtt[0]] >= c.minAtt[1])) return '';
+    let t = (v - range.min) / (range.max - range.min);
+    t = Math.max(0, Math.min(1, t));
+    if (c.heat < 0) return `background-color: rgba(var(--heat-neg), ${(t * 0.4).toFixed(3)})`;
+    return `background-color: rgba(var(--heat), ${(t * 0.45).toFixed(3)})`;
+  }
+
+  function renderPlayers() {
+    const { rows, mode } = playerRows();
+    const cols = COLS.filter(c => !c.only || c.only === mode);
+    const heatOn = $('#pHeat').checked;
+    const ranges = {};
+    if (heatOn) cols.filter(c => c.heat).forEach(c => {
+      const vals = rows.filter(r => (r.mpg || 0) >= 12 && (!c.minAtt || r[c.minAtt[0]] >= c.minAtt[1])).map(r => r[c.k]).filter(v => v != null).sort((a, b) => a - b);
+      if (vals.length > 3) ranges[c.k] = { min: vals[Math.floor(vals.length * 0.05)], max: vals[Math.floor(vals.length * 0.95)] };
+    });
+    const { k, dir } = state.pSort;
+    let h = '<table class="grid"><thead><tr>' + cols.map(c =>
+      `<th class="${c.text ? 't' : ''} ${c.sticky ? 'sticky' : ''} ${c.k === k ? 'sorted' : ''}" data-k="${c.k}" ${c.title ? `title="${esc(c.title)}"` : ''}>${esc(c.t)}${c.k === k ? `<span class="arr">${dir < 0 ? '▼' : '▲'}</span>` : ''}</th>`).join('') + '</tr></thead><tbody>';
+    const limit = 600;
+    rows.slice(0, limit).forEach((r, i) => {
+      h += '<tr>' + cols.map(c => {
+        if (c.k === 'rk') return `<td class="rk">${i + 1}</td>`;
+        if (c.k === 'status') return `<td class="t">${r.status ? `<span class="chip ${r.status === '결장' ? 'out' : 'dtd'}" title="${esc(r._p.injury ? [r._p.injury.type, r._p.injury.comment].filter(Boolean).join(' · ') : '직접 지정')}">${r.status}</span>` : ''}</td>`;
+        if (c.k === 'team') return `<td class="t"><a class="tlink" data-team="${esc(r.team)}">${esc(r.team)}</a></td>`;
+        if (c.text) return `<td class="t ${c.sticky ? 'sticky' : ''}">${esc(r[c.k])}</td>`;
+        const v = r[c.k];
+        return `<td style="${heatOn ? heatStyle(c, v, r, ranges[c.k]) : ''}">${c.pct ? pct(v) : fmt(v, c.d)}</td>`;
+      }).join('') + '</tr>';
+    });
+    h += '</tbody></table>';
+    $('#pTableWrap').innerHTML = h;
+    $('#pCount').textContent = `${rows.length}명` + (rows.length > limit ? ` (상위 ${limit}명 표시)` : '');
+  }
+  ['pMode', 'pTeam', 'pMinG', 'pInjOnly', 'pHeat'].forEach(id => $('#' + id).addEventListener('change', renderPlayers));
+  $('#pSearch').addEventListener('input', renderPlayers);
+  $('#pTableWrap').addEventListener('click', e => {
+    const a = e.target.closest('a.tlink');
+    if (a) { $('#pTeam').value = a.dataset.team; renderPlayers(); return; }
+    const th = e.target.closest('th[data-k]'); if (!th || th.dataset.k === 'rk') return;
+    const k = th.dataset.k, c = COLS.find(x => x.k === k);
+    state.pSort = { k, dir: state.pSort.k === k ? -state.pSort.dir : (c.text ? 1 : -1) };
+    renderPlayers();
+  });
+
+  function downloadCSV(name, header, rows) {
+    const q = v => { const s = v == null ? '' : String(v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+    const text = '﻿' + [header, ...rows].map(r => r.map(q).join(',')).join('\r\n');
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([text], { type: 'text/csv;charset=utf-8' }));
+    a.download = name; document.body.appendChild(a); a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+  }
+  $('#pCsv').addEventListener('click', () => {
+    const { rows, mode } = playerRows();
+    const cols = COLS.filter(c => c.k !== 'rk' && (!c.only || c.only === mode));
+    downloadCSV(`선수통계_${mode}_${$('#pTeam').value || '전체'}.csv`, cols.map(c => c.t),
+      rows.map(r => cols.map(c => { const v = r[c.k]; if (c.text) return v; if (v == null) return ''; return c.pct ? (v * 100).toFixed(1) : Number(v).toFixed(c.d == null ? 1 : c.d); })));
+  });
+
+  // ---------- 팀 통계 표 ----------
+  const TCOLS = [
+    { k: 'rk', t: '#' }, { k: 'name', t: '팀', text: 1, sticky: 1 }, { k: 'rec', t: LBL[CUR] + ' 전적', text: 1 },
+    { k: 'ppg', t: '득점', d: 1 }, { k: 'oppg', t: '실점', d: 1 }, { k: 'ortg', t: '공격 레이팅', d: 1 }, { k: 'drtg', t: '수비 레이팅', d: 1 },
+    { k: 'net', t: '넷 레이팅', d: 1 }, { k: 'pace', t: '페이스', d: 1 },
+    { k: 'precRec', t: LBL[PREV] + ' 전적', text: 1 }, { k: 'pnet', t: LBL[PREV] + ' 넷', d: 1 },
+    { k: 'roster', t: '로스터 레이팅(건강 시)', d: 1, title: '현재 로스터 선수들의 BPM×예상 출전시간 합 (리그 평균 0)' },
+    { k: 'outs', t: '결장자', d: 0 },
+    { k: 'model', t: '모델 레이팅(부상 반영)', d: 1, title: '중립 경기 기준 100포제션당 기대 점수 마진' },
+  ];
+  function teamRows() {
+    return TEAMS.map(t => {
+      const c = teamRow(CUR, t) || {}, p = teamRow(PREV, t) || {};
+      const M = teamModel(t, isOut);
+      return {
+        team: t, name: tName(t), rec: c.wins != null ? `${c.wins}-${c.losses}` : '–', ppg: c.ppg, oppg: c.opp_ppg,
+        ortg: c.off_rtg, drtg: c.def_rtg, net: c.net_rtg, pace: c.pace,
+        precRec: p.wins != null ? `${p.wins}-${p.losses}` : '–', pnet: p.net_rtg,
+        roster: (M.healthy.off - OFF_MEAN) + (M.healthy.def - DEF_MEAN),
+        outs: (byTeam[t] || []).filter(isOut).length, model: M.off + M.def,
+      };
+    });
+  }
+  function renderTeams() {
+    const rows = teamRows();
+    const { k, dir } = state.tSort, col = TCOLS.find(c => c.k === k) || {};
+    rows.sort((a, b) => col.text ? dir * String(a[k]).localeCompare(String(b[k]), 'ko') : dir * ((a[k] == null ? -999 : a[k]) - (b[k] == null ? -999 : b[k])));
+    let h = '<table class="grid"><thead><tr>' + TCOLS.map(c => `<th class="${c.text ? 't' : ''} ${c.sticky ? 'sticky' : ''} ${c.k === k ? 'sorted' : ''}" data-k="${c.k}" ${c.title ? `title="${esc(c.title)}"` : ''}>${esc(c.t)}${c.k === k ? `<span class="arr">${dir < 0 ? '▼' : '▲'}</span>` : ''}</th>`).join('') + '</tr></thead><tbody>';
+    rows.forEach((r, i) => {
+      h += '<tr>' + TCOLS.map(c => {
+        if (c.k === 'rk') return `<td class="rk">${i + 1}</td>`;
+        if (c.k === 'name') return `<td class="t sticky"><a class="tlink" data-team="${r.team}">${esc(r.name)}</a> <small>${r.team}</small></td>`;
+        if (c.text) return `<td class="t">${esc(r[c.k])}</td>`;
+        const v = r[c.k];
+        const cls = (c.k === 'net' || c.k === 'pnet' || c.k === 'model' || c.k === 'roster') && v != null ? (v > 0 ? 'diff-pos' : 'diff-neg') : '';
+        return `<td class="${cls}">${(c.k === 'net' || c.k === 'pnet' || c.k === 'model' || c.k === 'roster') ? signed(v, c.d) : fmt(v, c.d)}</td>`;
+      }).join('') + '</tr>';
+    });
+    $('#tTableWrap').innerHTML = h + '</tbody></table>';
+  }
+  $('#tTableWrap').addEventListener('click', e => {
+    const a = e.target.closest('a.tlink');
+    if (a) { $('#pTeam').value = a.dataset.team; showTab('players'); return; }
+    const th = e.target.closest('th[data-k]'); if (!th || th.dataset.k === 'rk') return;
+    const k = th.dataset.k, c = TCOLS.find(x => x.k === k);
+    state.tSort = { k, dir: state.tSort.k === k ? -state.tSort.dir : (c.text ? 1 : -1) };
+    renderTeams();
+  });
+  $('#tCsv').addEventListener('click', () => {
+    const rows = teamRows().sort((a, b) => b.model - a.model);
+    const cols = TCOLS.filter(c => c.k !== 'rk');
+    downloadCSV('팀통계.csv', cols.map(c => c.t), rows.map(r => cols.map(c => { const v = r[c.k]; return c.text ? v : (v == null ? '' : Number(v).toFixed(c.d)); })));
+  });
+
+  // ---------- 설정 / 설명 ----------
+  function renderSettings() {
+    let h = SETTINGS_META.map(([k, lb, step, tip]) => `<label>${esc(lb)} <input type="number" data-s="${k}" step="${step}" value="${S[k]}"><small>${esc(tip)}</small></label>`).join('');
+    h += `<label class="chk" style="display:flex"><input type="checkbox" data-s="dtdOut" ${S.dtdOut ? 'checked' : ''}> '출전 불투명(Day-To-Day)' 선수도 기본으로 결장 처리</label>`;
+    $('#settingsForm').innerHTML = h;
+  }
+  $('#settingsForm').addEventListener('change', e => {
+    const el = e.target.closest('[data-s]'); if (!el) return;
+    const k = el.dataset.s;
+    if (el.type === 'checkbox') S[k] = el.checked;
+    else { const v = parseFloat(el.value); if (!isNaN(v)) S[k] = v; }
+    save('settings', S); recenter(); renderAll();
+  });
+  $('#resetSettings').addEventListener('click', () => { S = Object.assign({}, DEFAULTS); save('settings', S); renderSettings(); recenter(); renderAll(); });
+
+  $('#helpText').innerHTML = `
+    <h2>이 프로그램이 예측하는 방법</h2>
+    <p>각 팀의 <b>공격력·수비력</b>을 "리그 평균 대비 100포제션당 몇 점 더/덜"로 계산하고, 두 팀의 <b>페이스(경기 속도)</b>로 실제 점수로 바꿉니다.</p>
+    <h3>1. 팀 기본 전력</h3>
+    <ul>
+      <li><b>이번 시즌 실제 성적</b> (공격/수비 레이팅): 경기를 많이 치를수록 비중이 커집니다. 기본값은 ${S.teamK}경기를 치르면 50%.</li>
+      <li><b>시즌 전 기준값</b> = 현재 로스터 선수들의 능력(BPM × 예상 출전시간) ${Math.round(S.rosterW * 100)}% + 지난 시즌 팀 성적 ${Math.round((1 - S.rosterW) * 100)}%. 비시즌 이적이 반영됩니다.</li>
+    </ul>
+    <h3>2. 부상자 반영</h3>
+    <ul>
+      <li>결장 체크된 선수의 예상 출전 시간(분)을 빼고, 남은 선수들에게 240분을 비례해서 다시 나눠 줍니다 (1인 최대 40분).</li>
+      <li>각 선수의 <b>OBPM/DBPM</b>(100포제션당 공격·수비 기여도)에 바뀐 출전 시간을 곱해 팀 전력을 다시 계산합니다. 그래서 주전이 빠지면 벤치 선수가 시간을 더 받는 효과까지 들어갑니다.</li>
+      <li>단순히 "그 선수 평균 득점만큼 빠진다"가 아니라, 대체 선수가 일부를 메운 뒤의 순수 손실을 계산합니다. 로스터 표의 <b>결장 영향</b> 열이 그 선수 혼자 빠질 때의 점수차 변화입니다.</li>
+      <li>ESPN 부상자 명단에서 '결장(Out)'인 선수는 자동으로 체크됩니다. 체크박스로 직접 바꿀 수 있고, 바꾼 내용은 이 브라우저에 저장됩니다.</li>
+      <li>출전 시간이 적은 선수의 BPM은 평균 이하 쪽으로 당겨서 계산합니다 (몇 경기 반짝 기록에 휘둘리지 않도록).</li>
+    </ul>
+    <h3>3. 점수와 확률</h3>
+    <ul>
+      <li>예상 득점 = (리그 평균 효율 + 우리 공격 − 상대 수비) × 예상 페이스 ÷ 100, 여기에 홈 어드밴티지(${S.hca}점)와 백투백(${S.b2b}점), 직접 보정을 더합니다.</li>
+      <li>승리 확률은 실제 점수차가 예상에서 표준편차 ${S.sdMargin}점 정도로 흔들린다고 보고 계산합니다 (정규분포). 언더오버는 총점 표준편차 ${S.sdTotal}점을 씁니다.</li>
+      <li><b>기대값</b> = 모델 확률 × 배당 − 1. +5%면 1만 원당 평균 500원 이득이라는 뜻이지만, 모델이 틀릴 수 있다는 점을 꼭 감안하세요.</li>
+    </ul>
+    <h3>4. 한계</h3>
+    <ul>
+      <li>시즌 초반에는 이번 시즌 표본이 적어서 지난 시즌 기록 비중이 큽니다.</li>
+      <li>코칭, 동기 부여, 경기 당일 컨디션, 출전 시간 제한(minutes restriction)은 모릅니다. 필요하면 '보정' 칸에 점수로 넣으세요.</li>
+      <li>이름 표기가 달라 통계가 연결되지 않은 선수(주로 신인)는 출전 시간 0으로 계산됩니다.</li>
+      <li>해외 시장 라인과 큰 차이가 나면 모델이 모르는 정보(부상 소식 등)가 있을 가능성도 생각하세요.</li>
+    </ul>
+    <h3>데이터 업데이트</h3>
+    <p>폴더 안의 <code>시작하기.command</code>를 더블클릭하거나 터미널에서 <code>python3 update_data.py</code>를 실행하면 최신 통계·부상자·일정을 받아옵니다. 경기 전날·당일에 한 번씩 업데이트하는 걸 추천해요.</p>`;
+
+  // ---------- 시작 ----------
+  function renderAll() {
+    renderGames(); renderPredict();
+    if (state.tab === 'players') renderPlayers();
+    if (state.tab === 'teams') renderTeams();
+  }
+  recenter();
+  renderSettings();
+  const now = Date.now();
+  const firstGame = games.find(g => g.state !== 'post' && new Date(g.date).getTime() > now - 4 * 3600 * 1000) || games[games.length - 1];
+  if (firstGame) selectGame(firstGame);
+  else { state.home = TEAMS[0]; state.away = TEAMS[1]; syncPickers(); renderGames(); renderPredict(); }
+  showTab(state.tab);
+})();
